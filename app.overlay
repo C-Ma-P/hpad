@@ -1,0 +1,88 @@
+/ {
+	chosen {
+		zephyr,display = &ssd1306;
+	};
+
+	encoder_inputs {
+		compatible = "gpio-keys";
+
+		encoder_a: encoder_a {
+			gpios = <&gpio0 10 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Encoder A";
+		};
+
+		encoder_b: encoder_b {
+			gpios = <&gpio1 11 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Encoder B";
+		};
+
+		encoder_button: encoder_button {
+			gpios = <&gpio1 6 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Encoder Button";
+		};
+	};
+
+	aliases {
+		encoder-a = &encoder_a;
+		encoder-b = &encoder_b;
+		encoder-button = &encoder_button;
+	};
+};
+
+&gpio0 {
+	peripheral_vcc_enable: peripheral_vcc_enable {
+		gpio-hog;
+		gpios = <31 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "peripheral-vcc-enable";
+	};
+};
+
+&pinctrl {
+	oled_i2c_default: oled_i2c_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 17)>,
+				<NRF_PSEL(TWIM_SCL, 0, 20)>;
+			bias-pull-up;
+		};
+	};
+
+	oled_i2c_sleep: oled_i2c_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 17)>,
+				<NRF_PSEL(TWIM_SCL, 0, 20)>;
+			low-power-enable;
+		};
+	};
+};
+
+&i2c0 {
+	/delete-property/ zephyr,pm-device-runtime-auto;
+	compatible = "nordic,nrf-twim";
+	clock-frequency = <100000>;
+	zephyr,concat-buf-size = <513>;
+	zephyr,flash-buf-max-size = <513>;
+	pinctrl-0 = <&oled_i2c_default>;
+	pinctrl-1 = <&oled_i2c_sleep>;
+	pinctrl-names = "default", "sleep";
+	status = "okay";
+
+	ssd1306: ssd1306@3c {
+		compatible = "solomon,ssd1306fb";
+		status = "okay";
+		reg = <0x3c>;
+
+		width = <128>;
+		height = <32>;
+
+		segment-offset = <0>;
+		page-offset = <0>;
+		display-offset = <0>;
+		multiplex-ratio = <31>;
+		segment-remap;
+		com-invdir;
+		com-sequential;
+		prechargep = <0xf1>;
+		ready-time-ms = <100>;
+	};
+};
