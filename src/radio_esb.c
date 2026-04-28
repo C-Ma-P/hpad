@@ -278,15 +278,13 @@ int radio_esb_start(void)
 	return 0;
 }
 
-int radio_esb_send_heartbeat(void)
+int radio_esb_send_heartbeat(const macropad_report_t *report)
 {
-	const macropad_report_t report = {
-		.keys = 0U,
-		.encoder_delta = 0,
-		.encoder_pressed = 0U,
-	};
+	if (report == NULL) {
+		return -EINVAL;
+	}
 
-	return radio_esb_send_report(RADIO_ESB_TX_HEARTBEAT, &report);
+	return radio_esb_send_report(RADIO_ESB_TX_HEARTBEAT, report);
 }
 
 int radio_esb_send_macropad_report(const macropad_report_t *report)

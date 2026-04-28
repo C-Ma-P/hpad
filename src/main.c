@@ -9,12 +9,16 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <zephyr/drivers/adc.h>
 #include <zephyr/device.h>
 #include <zephyr/display/cfb.h>
+#include <zephyr/dt-bindings/adc/nrf-saadc.h>
 #include <zephyr/drivers/display.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+
+#include <hal/nrf_power.h>
 
 #include "encoder.h"
 #include "radio_esb.h"
@@ -25,19 +29,25 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define DISPLAY_ICON_X 0U
 #define DISPLAY_STATUS_Y 0U
 #define DISPLAY_ACK_X 24U
+#define DISPLAY_CHARGING_X 88U
 #define DISPLAY_VALUE_X 0U
 #define DISPLAY_VALUE_Y 16U
 #define DISPLAY_CONNECTED_ICON "[+]"
 #define DISPLAY_DISCONNECTED_ICON "[x]"
 #define DISPLAY_ACK_TEXT "ACK"
+#define DISPLAY_CHARGING_TEXT "USB"
 #define DISPLAY_REFRESH_INTERVAL_MS 40
 #define ACK_VISIBLE_MS 50
 #define HEARTBEAT_INTERVAL_MS 1000
 #define CONNECTION_TIMEOUT_MS 2500
 #define INPUT_ACTIVITY_LED_PULSE_MS 80
 #define APP_EVENT_QUEUE_LEN 8
+#define BATTERY_ADC_CHANNEL_ID 0U
+#define BATTERY_ADC_RESOLUTION 14U
+#define BATTERY_ADC_OVERSAMPLING 4U
 
 static const struct device *const display = DEVICE_DT_GET(DISPLAY_NODE);
+static const struct device *const battery_adc = DEVICE_DT_GET(DT_NODELABEL(adc));
 static struct k_spinlock input_state_lock;
 
 enum app_event_type {
@@ -56,6 +66,7 @@ struct app_event {
 
 struct app_ui_state {
 	bool connected;
+	bool charging;
 	bool show_ack;
 	int64_t ack_visible_until_ms;
 	int64_t last_delivery_success_ms;
@@ -66,6 +77,8 @@ struct macropad_input_state {
 	uint8_t keys;
 	int8_t encoder_delta;
 	uint8_t encoder_pressed;
+	uint16_t battery_mv;
+	uint8_t charging;
 };
 
 K_MSGQ_DEFINE(app_event_queue, sizeof(struct app_event), APP_EVENT_QUEUE_LEN, 4);
@@ -74,6 +87,23 @@ static struct macropad_input_state macropad_input_state;
 static struct k_work_delayable status_led_off_work;
 static int32_t pending_encoder_delta;
 static bool encoder_delta_event_pending;
+static bool battery_monitor_ready;
+static int16_t battery_sample_raw;
+static struct adc_channel_cfg battery_channel_cfg = {
+	.gain = ADC_GAIN_1_6,
+	.reference = ADC_REF_INTERNAL,
+	.acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40),
+	.channel_id = BATTERY_ADC_CHANNEL_ID,
+	.input_positive = NRF_SAADC_VDDHDIV5,
+};
+static struct adc_sequence battery_sequence = {
+	.channels = BIT(BATTERY_ADC_CHANNEL_ID),
+	.buffer = &battery_sample_raw,
+	.buffer_size = sizeof(battery_sample_raw),
+	.oversampling = BATTERY_ADC_OVERSAMPLING,
+	.calibrate = true,
+	.resolution = BATTERY_ADC_RESOLUTION,
+};
 
 #if DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
 static const struct gpio_dt_spec status_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
@@ -171,6 +201,14 @@ static int render_status_display(const struct app_ui_state *state)
 		}
 	}
 
+	if (state->charging) {
+		rc = cfb_print(display, DISPLAY_CHARGING_TEXT, DISPLAY_CHARGING_X, DISPLAY_STATUS_Y);
+		if (rc != 0) {
+			LOG_ERR("cfb_print charging failed: %d", rc);
+			return rc;
+		}
+	}
+
 	rc = cfb_print(display, value_text, DISPLAY_VALUE_X, DISPLAY_VALUE_Y);
 	if (rc != 0) {
 		LOG_ERR("cfb_print value failed: %d", rc);
@@ -185,15 +223,102 @@ static int render_status_display(const struct app_ui_state *state)
 	return rc;
 }
 
+static bool battery_is_charging(void)
+{
+	return nrf_power_usbregstatus_vbusdet_get(NRF_POWER);
+}
+
+static int battery_monitor_init(void)
+{
+	int rc;
+
+	if (!device_is_ready(battery_adc)) {
+		LOG_WRN("Battery ADC not ready");
+		return -ENODEV;
+	}
+
+	rc = adc_channel_setup(battery_adc, &battery_channel_cfg);
+	if (rc != 0) {
+		LOG_ERR("Battery ADC channel setup failed: %d", rc);
+		return rc;
+	}
+
+	battery_monitor_ready = true;
+	return 0;
+}
+
+static uint16_t battery_sample_mv(void)
+{
+	int rc;
+	int32_t sample_mv;
+
+	if (!battery_monitor_ready) {
+		return 0U;
+	}
+
+	rc = adc_read(battery_adc, &battery_sequence);
+	battery_sequence.calibrate = false;
+	if (rc != 0) {
+		LOG_WRN("Battery ADC read failed: %d", rc);
+		return 0U;
+	}
+
+	sample_mv = battery_sample_raw;
+	rc = adc_raw_to_millivolts(adc_ref_internal(battery_adc),
+		battery_channel_cfg.gain,
+		battery_sequence.resolution,
+		&sample_mv);
+	if (rc != 0) {
+		LOG_WRN("Battery ADC conversion failed: %d", rc);
+		return 0U;
+	}
+
+	sample_mv *= 5;
+	if (sample_mv <= 0) {
+		return 0U;
+	}
+	if (sample_mv > UINT16_MAX) {
+		return UINT16_MAX;
+	}
+
+	return (uint16_t)sample_mv;
+}
+
+static void refresh_battery_state(struct macropad_input_state *state)
+{
+	state->battery_mv = battery_sample_mv();
+	state->charging = battery_is_charging() ? 1U : 0U;
+}
+
 static int macropad_send_report(void)
 {
-	const macropad_report_t report = {
+	macropad_report_t report;
+
+	refresh_battery_state(&macropad_input_state);
+	report = (macropad_report_t){
 		.keys = macropad_input_state.keys,
 		.encoder_delta = macropad_input_state.encoder_delta,
 		.encoder_pressed = macropad_input_state.encoder_pressed,
+		.battery_mv = macropad_input_state.battery_mv,
+		.charging = macropad_input_state.charging,
 	};
 
 	return radio_esb_send_macropad_report(&report);
+}
+
+static int macropad_send_heartbeat(void)
+{
+	macropad_report_t report = {
+		.keys = 0U,
+		.encoder_delta = 0,
+		.encoder_pressed = 0U,
+	};
+
+	refresh_battery_state(&macropad_input_state);
+	report.battery_mv = macropad_input_state.battery_mv;
+	report.charging = macropad_input_state.charging;
+
+	return radio_esb_send_heartbeat(&report);
 }
 
 static int send_encoder_delta_reports(int32_t total_delta)
@@ -281,6 +406,12 @@ static void handle_radio_delivery(enum radio_esb_tx_kind kind, bool acked)
 static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 {
 	bool dirty = false;
+	bool charging = battery_is_charging();
+
+	if (state->charging != charging) {
+		state->charging = charging;
+		dirty = true;
+	}
 
 	if (state->show_ack && (now_ms >= state->ack_visible_until_ms)) {
 		state->show_ack = false;
@@ -328,6 +459,7 @@ int main(void)
 	struct app_event event;
 	struct app_ui_state ui_state = {
 		.connected = false,
+		.charging = false,
 		.show_ack = false,
 		.ack_visible_until_ms = 0,
 		.last_delivery_success_ms = INT64_MIN,
@@ -346,6 +478,12 @@ int main(void)
 	} else {
 		LOG_INF("Status LED unavailable (rc=%d)", rc);
 	}
+
+	rc = battery_monitor_init();
+	if (rc != 0) {
+		LOG_INF("Battery monitor unavailable (rc=%d)", rc);
+	}
+	ui_state.charging = battery_is_charging();
 
 	LOG_INF("boot: entering main()");
 	if (!device_is_ready(display)) {
@@ -433,9 +571,9 @@ int main(void)
 		}
 
 		if (now_ms >= next_heartbeat_ms) {
-			rc = radio_esb_send_heartbeat();
+			rc = macropad_send_heartbeat();
 			if (rc != 0) {
-				LOG_WRN("radio_esb_send_heartbeat failed: %d", rc);
+				LOG_WRN("macropad_send_heartbeat failed: %d", rc);
 			}
 			next_heartbeat_ms = now_ms + HEARTBEAT_INTERVAL_MS;
 		}
