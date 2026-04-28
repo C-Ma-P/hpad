@@ -1,6 +1,9 @@
+#include <zephyr/dt-bindings/led/led.h>
+
 / {
 	chosen {
 		zephyr,display = &ssd1306;
+		zephyr,led-strip = &led_strip;
 	};
 
 	encoder_inputs {
@@ -26,6 +29,7 @@
 		encoder-a = &encoder_a;
 		encoder-b = &encoder_b;
 		encoder-button = &encoder_button;
+		led-strip = &led_strip;
 	};
 };
 
@@ -84,5 +88,15 @@
 		com-sequential;
 		prechargep = <0xf1>;
 		ready-time-ms = <100>;
+	};
+};
+
+/ {
+	led_strip: ws2812 {
+		compatible = "worldsemi,ws2812-gpio";
+		chain-length = <6>;
+		color-mapping = <LED_COLOR_ID_GREEN LED_COLOR_ID_RED LED_COLOR_ID_BLUE>;
+		reset-delay = <50>;
+		gpios = <&gpio0 2 0>;
 	};
 };

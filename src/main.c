@@ -15,6 +15,7 @@
 #include <zephyr/dt-bindings/adc/nrf-saadc.h>
 #include <zephyr/drivers/display.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/led_strip.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
@@ -45,6 +46,18 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define BATTERY_ADC_CHANNEL_ID 0U
 #define BATTERY_ADC_RESOLUTION 14U
 #define BATTERY_ADC_OVERSAMPLING 4U
+#define STARTUP_LED_STRIP_BLUE_LEVEL 0x40U
+
+#define LED_STRIP_NODE DT_ALIAS(led_strip)
+
+#if DT_NODE_EXISTS(LED_STRIP_NODE) && DT_NODE_HAS_STATUS(LED_STRIP_NODE, okay)
+#define HAVE_STARTUP_LED_STRIP 1
+#define STARTUP_LED_STRIP_LENGTH DT_PROP(LED_STRIP_NODE, chain_length)
+static const struct device *const startup_led_strip = DEVICE_DT_GET(LED_STRIP_NODE);
+static struct led_rgb startup_led_strip_pixels[STARTUP_LED_STRIP_LENGTH];
+#else
+#define HAVE_STARTUP_LED_STRIP 0
+#endif
 
 static const struct device *const display = DEVICE_DT_GET(DISPLAY_NODE);
 static const struct device *const battery_adc = DEVICE_DT_GET(DT_NODELABEL(adc));
@@ -157,6 +170,31 @@ static int setup_status_led(void)
 	k_work_init_delayable(&status_led_off_work, status_led_off_work_handler);
 
 	return gpio_pin_configure_dt(&status_led, GPIO_OUTPUT_INACTIVE);
+#else
+	return -ENOTSUP;
+#endif
+}
+
+static int setup_startup_led_strip(void)
+{
+#if HAVE_STARTUP_LED_STRIP
+	const struct led_rgb blue = {
+		.r = 0U,
+		.g = 0U,
+		.b = STARTUP_LED_STRIP_BLUE_LEVEL,
+	};
+
+	if (!device_is_ready(startup_led_strip)) {
+		return -ENODEV;
+	}
+
+	for (size_t idx = 0; idx < STARTUP_LED_STRIP_LENGTH; ++idx) {
+		startup_led_strip_pixels[idx] = blue;
+	}
+
+	return led_strip_update_rgb(startup_led_strip,
+					startup_led_strip_pixels,
+					STARTUP_LED_STRIP_LENGTH);
 #else
 	return -ENOTSUP;
 #endif
@@ -477,6 +515,11 @@ int main(void)
 		blink_status_led(1, 120, 120);
 	} else {
 		LOG_INF("Status LED unavailable (rc=%d)", rc);
+	}
+
+	rc = setup_startup_led_strip();
+	if (rc != 0) {
+		LOG_INF("Startup LED strip unavailable (rc=%d)", rc);
 	}
 
 	rc = battery_monitor_init();
