@@ -24,11 +24,66 @@
 		};
 	};
 
+	macropad_keys {
+		compatible = "gpio-keys";
+
+		// good
+		macro_key_0: macro_key_0 {
+			gpios = <&gpio0 8 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Macro Key 0";
+		};
+
+		// good
+		macro_key_1: macro_key_1 {
+			gpios = <&gpio0 6 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Macro Key 1";
+		};
+
+		// good
+		macro_key_2: macro_key_2 {
+			gpios = <&gpio0 22 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Macro Key 2";
+		};
+
+		// good
+		macro_key_3: macro_key_3 {
+			gpios = <&gpio0 24 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Macro Key 3";
+		};
+
+		//  good
+		macro_key_4: macro_key_4 {
+			gpios = <&gpio1 0 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Macro Key 4";
+		};
+
+		// good
+		macro_key_5: macro_key_5 {
+			gpios = <&gpio0 2 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Macro Key 5";
+		};
+	};
+
+	buzzer_gpio {
+		compatible = "gpio-leds";
+		buzzer_out: buzzer {
+			gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
+			label = "Buzzer";
+		};
+	};
+
 	aliases {
 		encoder-a = &encoder_a;
 		encoder-b = &encoder_b;
 		encoder-button = &encoder_button;
+		macro-key-0 = &macro_key_0;
+		macro-key-1 = &macro_key_1;
+		macro-key-2 = &macro_key_2;
+		macro-key-3 = &macro_key_3;
+		macro-key-4 = &macro_key_4;
+		macro-key-5 = &macro_key_5;
 		led-strip = &led_strip;
+		buzzer = &buzzer_out;
 	};
 };
 
@@ -60,15 +115,15 @@
 
 	ws2812_spi_default: ws2812_spi_default {
 		group1 {
-			psels = <NRF_PSEL(SPIM_SCK, 0, 3)>,
-				<NRF_PSEL(SPIM_MOSI, 0, 2)>;
+			psels = <NRF_PSEL(SPIM_SCK, 1, 13)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 15)>;
 		};
 	};
 
 	ws2812_spi_sleep: ws2812_spi_sleep {
 		group1 {
-			psels = <NRF_PSEL(SPIM_SCK, 0, 3)>,
-				<NRF_PSEL(SPIM_MOSI, 0, 2)>;
+			psels = <NRF_PSEL(SPIM_SCK, 1, 13)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 15)>;
 			low-power-enable;
 		};
 	};

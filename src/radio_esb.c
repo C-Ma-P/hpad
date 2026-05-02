@@ -21,6 +21,8 @@
 #define RADIO_ESB_PROTOCOL_DPL ESB_PROTOCOL_ESB_DPL
 #define RADIO_ESB_BITRATE_2MBPS ESB_BITRATE_2MBPS
 #define RADIO_ESB_MODE_PTX ESB_MODE_PTX
+#define RADIO_ESB_EVENT_RX_RECEIVED ESB_EVENT_RX_RECEIVED
+#define radio_esb_api_read_rx_payload esb_read_rx_payload
 #define radio_esb_api_flush_rx esb_flush_rx
 #define radio_esb_api_flush_tx esb_flush_tx
 #define radio_esb_api_init esb_init
@@ -41,6 +43,8 @@
 #define RADIO_ESB_PROTOCOL_DPL NRF_ESB_PROTOCOL_ESB_DPL
 #define RADIO_ESB_BITRATE_2MBPS NRF_ESB_BITRATE_2MBPS
 #define RADIO_ESB_MODE_PTX NRF_ESB_MODE_PTX
+#define RADIO_ESB_EVENT_RX_RECEIVED NRF_ESB_EVENT_RX_RECEIVED
+#define radio_esb_api_read_rx_payload nrf_esb_read_rx_payload
 #define radio_esb_api_flush_rx nrf_esb_flush_rx
 #define radio_esb_api_flush_tx nrf_esb_flush_tx
 #define radio_esb_api_init nrf_esb_init
@@ -58,11 +62,13 @@ LOG_MODULE_REGISTER(radio_esb, LOG_LEVEL_INF);
 #define RADIO_TX_QUEUE_LEN 4
 #define RADIO_EVENT_TX_SUCCESS_FLAG BIT(0)
 #define RADIO_EVENT_TX_FAILED_FLAG BIT(1)
+#define RADIO_EVENT_RX_FLAG BIT(2)
 
 static struct k_mutex radio_lock;
 static struct k_work radio_work;
 static atomic_t pending_events;
 static radio_esb_delivery_handler_t tx_delivery_handler;
+static radio_esb_config_handler_t rx_config_handler;
 static enum radio_esb_tx_kind tx_queue[RADIO_TX_QUEUE_LEN];
 static size_t tx_queue_head;
 static size_t tx_queue_tail;
@@ -77,6 +83,9 @@ static void radio_esb_schedule_worker(void)
 static void radio_esb_event_handler(const RADIO_ESB_EVENT *event)
 {
 	switch (event->evt_id) {
+	case RADIO_ESB_EVENT_RX_RECEIVED:
+		atomic_or(&pending_events, RADIO_EVENT_RX_FLAG);
+		break;
 	case RADIO_ESB_EVENT_TX_SUCCESS:
 		atomic_or(&pending_events, RADIO_EVENT_TX_SUCCESS_FLAG);
 		break;
@@ -165,9 +174,12 @@ static int radio_esb_send_report(enum radio_esb_tx_kind kind,
 
 static void radio_esb_work_handler(struct k_work *work)
 {
+	RADIO_ESB_PAYLOAD payload;
+	macropad_config_t config;
 	atomic_val_t events;
 	enum radio_esb_tx_kind kind;
 	bool dequeued;
+	int rc;
 
 	ARG_UNUSED(work);
 
@@ -202,10 +214,30 @@ static void radio_esb_work_handler(struct k_work *work)
 			LOG_WRN("TX failure reported with no queued report kind");
 		}
 	}
+
+	if ((events & RADIO_EVENT_RX_FLAG) == 0) {
+		return;
+	}
+
+	memset(&payload, 0, sizeof(payload));
+	while ((rc = radio_esb_api_read_rx_payload(&payload)) == 0) {
+		if (payload.length != sizeof(config)) {
+			LOG_WRN("Rejected ACK payload on pipe %u len=%u", payload.pipe, payload.length);
+			memset(&payload, 0, sizeof(payload));
+			continue;
+		}
+
+		memcpy(&config, payload.data, sizeof(config));
+		if ((config.kind == MACROPAD_CONFIG_KIND_KEY_COLORS) && (rx_config_handler != NULL)) {
+			rx_config_handler(&config);
+		}
+		memset(&payload, 0, sizeof(payload));
+	}
 }
 
 int radio_esb_init(const struct esb_addr_config *addr_config, uint8_t rf_channel,
-		   radio_esb_delivery_handler_t delivery_handler)
+		   radio_esb_delivery_handler_t delivery_handler,
+		   radio_esb_config_handler_t config_handler)
 {
 	RADIO_ESB_CONFIG config = RADIO_ESB_DEFAULT_CONFIG;
 	int rc;
@@ -230,6 +262,7 @@ int radio_esb_init(const struct esb_addr_config *addr_config, uint8_t rf_channel
 	tx_queue_tail = 0U;
 	tx_queue_count = 0U;
 	tx_delivery_handler = delivery_handler;
+	rx_config_handler = config_handler;
 
 	rc = radio_esb_api_init(&config);
 	if (rc != 0) {

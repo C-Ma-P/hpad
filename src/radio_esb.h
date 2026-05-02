@@ -12,9 +12,11 @@ enum radio_esb_tx_kind {
 };
 
 typedef void (*radio_esb_delivery_handler_t)(enum radio_esb_tx_kind kind, bool acked);
+typedef void (*radio_esb_config_handler_t)(const macropad_config_t *config);
 
 int radio_esb_init(const struct esb_addr_config *addr_config, uint8_t rf_channel,
-		   radio_esb_delivery_handler_t delivery_handler);
+		   radio_esb_delivery_handler_t delivery_handler,
+		   radio_esb_config_handler_t config_handler);
 int radio_esb_start(void);
 int radio_esb_send_heartbeat(const macropad_report_t *report);
 int radio_esb_send_macropad_report(const macropad_report_t *report);

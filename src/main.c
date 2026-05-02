@@ -22,6 +22,8 @@
 #include <hal/nrf_power.h>
 
 #include "encoder.h"
+#include "macropad_config.h"
+#include "macropad_keys.h"
 #include "radio_esb.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
@@ -46,17 +48,15 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define BATTERY_ADC_CHANNEL_ID 0U
 #define BATTERY_ADC_RESOLUTION 14U
 #define BATTERY_ADC_OVERSAMPLING 4U
-#define STARTUP_LED_STRIP_BLUE_LEVEL 0x40U
-
 #define LED_STRIP_NODE DT_ALIAS(led_strip)
 
 #if DT_NODE_EXISTS(LED_STRIP_NODE) && DT_NODE_HAS_STATUS(LED_STRIP_NODE, okay)
-#define HAVE_STARTUP_LED_STRIP 1
-#define STARTUP_LED_STRIP_LENGTH DT_PROP(LED_STRIP_NODE, chain_length)
-static const struct device *const startup_led_strip = DEVICE_DT_GET(LED_STRIP_NODE);
-static struct led_rgb startup_led_strip_pixels[STARTUP_LED_STRIP_LENGTH];
+#define HAVE_MACROPAD_LED_STRIP 1
+#define MACROPAD_LED_STRIP_LENGTH DT_PROP(LED_STRIP_NODE, chain_length)
+static const struct device *const macropad_led_strip = DEVICE_DT_GET(LED_STRIP_NODE);
+static struct led_rgb macropad_led_strip_pixels[MACROPAD_LED_STRIP_LENGTH];
 #else
-#define HAVE_STARTUP_LED_STRIP 0
+#define HAVE_MACROPAD_LED_STRIP 0
 #endif
 
 static const struct device *const display = DEVICE_DT_GET(DISPLAY_NODE);
@@ -67,6 +67,8 @@ enum app_event_type {
 	APP_EVENT_ENCODER_DELTA = 0,
 	APP_EVENT_ENCODER_BUTTON = 1,
 	APP_EVENT_TX_RESULT = 2,
+	APP_EVENT_MACROPAD_KEYS = 3,
+	APP_EVENT_MACROPAD_CONFIG = 4,
 };
 
 struct app_event {
@@ -74,7 +76,10 @@ struct app_event {
 	uint8_t tx_kind;
 	uint8_t acked;
 	uint8_t pressed;
+	uint8_t keys;
+	uint8_t key_mask;
 	int8_t encoder_delta;
+	macropad_config_t config;
 };
 
 struct app_ui_state {
@@ -123,6 +128,13 @@ static const struct gpio_dt_spec status_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), g
 #define HAVE_STATUS_LED 1
 #else
 #define HAVE_STATUS_LED 0
+#endif
+
+#if DT_NODE_HAS_STATUS(DT_ALIAS(buzzer), okay)
+static const struct gpio_dt_spec buzzer = GPIO_DT_SPEC_GET(DT_ALIAS(buzzer), gpios);
+#define HAVE_BUZZER 1
+#else
+#define HAVE_BUZZER 0
 #endif
 
 static void set_status_led(bool on)
@@ -175,29 +187,88 @@ static int setup_status_led(void)
 #endif
 }
 
-static int setup_startup_led_strip(void)
+static int setup_buzzer(void)
 {
-#if HAVE_STARTUP_LED_STRIP
-	const struct led_rgb blue = {
-		.r = 0U,
-		.g = 0U,
-		.b = STARTUP_LED_STRIP_BLUE_LEVEL,
-	};
-
-	if (!device_is_ready(startup_led_strip)) {
+#if HAVE_BUZZER
+	if (!gpio_is_ready_dt(&buzzer)) {
 		return -ENODEV;
 	}
 
-	for (size_t idx = 0; idx < STARTUP_LED_STRIP_LENGTH; ++idx) {
-		startup_led_strip_pixels[idx] = blue;
-	}
-
-	return led_strip_update_rgb(startup_led_strip,
-					startup_led_strip_pixels,
-					STARTUP_LED_STRIP_LENGTH);
+	return gpio_pin_configure_dt(&buzzer, GPIO_OUTPUT_INACTIVE);
 #else
 	return -ENOTSUP;
 #endif
+}
+
+static void set_buzzer(bool on)
+{
+#if HAVE_BUZZER
+	gpio_pin_set_dt(&buzzer, on ? 1 : 0);
+#else
+	ARG_UNUSED(on);
+#endif
+}
+
+static uint8_t scale_led_channel(uint8_t value, uint8_t brightness)
+{
+	return (uint8_t)(((uint16_t)value * (uint16_t)brightness + 127U) / 255U);
+}
+
+static int update_macropad_key_leds(uint8_t keys)
+{
+#if HAVE_MACROPAD_LED_STRIP
+	const macropad_config_t *config = macropad_config_get();
+
+	for (size_t index = 0; index < MACROPAD_LED_STRIP_LENGTH; ++index) {
+		struct led_rgb color = { 0 };
+
+		if ((index < WIRE_PROTOCOL_KEY_COUNT) && ((keys & BIT(index)) != 0U)) {
+			const macropad_key_led_config_t *key_config = &config->keys[index];
+
+			color = (struct led_rgb){
+				.r = scale_led_channel(key_config->r, key_config->brightness),
+				.g = scale_led_channel(key_config->g, key_config->brightness),
+				.b = scale_led_channel(key_config->b, key_config->brightness),
+			};
+		}
+
+		macropad_led_strip_pixels[index] = color;
+	}
+
+	return led_strip_update_rgb(macropad_led_strip,
+					macropad_led_strip_pixels,
+					MACROPAD_LED_STRIP_LENGTH);
+#else
+	ARG_UNUSED(keys);
+	return -ENOTSUP;
+#endif
+}
+
+static int setup_macropad_led_strip(void)
+{
+#if HAVE_MACROPAD_LED_STRIP
+	if (!device_is_ready(macropad_led_strip)) {
+		return -ENODEV;
+	}
+
+	return update_macropad_key_leds(0U);
+#else
+	return -ENOTSUP;
+#endif
+}
+
+static void apply_macropad_key_config(const macropad_config_t *config)
+{
+	int rc;
+
+	if ((config == NULL) || (config->kind != MACROPAD_CONFIG_KIND_KEY_COLORS)) {
+		return;
+	}
+
+	rc = macropad_config_store(config);
+	if (rc != 0) {
+		LOG_WRN("Failed to persist macropad LED config: %d", rc);
+	}
 }
 
 static int app_queue_event(const struct app_event *event)
@@ -430,12 +501,38 @@ static void handle_encoder_button(bool pressed)
 	(void)app_queue_event(&event);
 }
 
+static void handle_macropad_keys(uint8_t key_mask, bool pressed, uint8_t keys)
+{
+	const struct app_event event = {
+		.type = APP_EVENT_MACROPAD_KEYS,
+		.pressed = pressed ? 1U : 0U,
+		.keys = keys,
+		.key_mask = key_mask,
+	};
+
+	if (key_mask == 0U) {
+		return;
+	}
+
+	(void)app_queue_event(&event);
+}
+
 static void handle_radio_delivery(enum radio_esb_tx_kind kind, bool acked)
 {
 	const struct app_event event = {
 		.type = APP_EVENT_TX_RESULT,
 		.tx_kind = (uint8_t)kind,
 		.acked = acked ? 1U : 0U,
+	};
+
+	(void)app_queue_event(&event);
+}
+
+static void handle_radio_config(const macropad_config_t *config)
+{
+	struct app_event event = {
+		.type = APP_EVENT_MACROPAD_CONFIG,
+		.config = *config,
 	};
 
 	(void)app_queue_event(&event);
@@ -517,9 +614,19 @@ int main(void)
 		LOG_INF("Status LED unavailable (rc=%d)", rc);
 	}
 
-	rc = setup_startup_led_strip();
+	rc = setup_buzzer();
 	if (rc != 0) {
-		LOG_INF("Startup LED strip unavailable (rc=%d)", rc);
+		LOG_INF("Buzzer unavailable (rc=%d)", rc);
+	}
+
+	rc = macropad_config_init();
+	if (rc != 0) {
+		LOG_INF("Macropad LED config unavailable (rc=%d)", rc);
+	}
+
+	rc = setup_macropad_led_strip();
+	if (rc != 0) {
+		LOG_INF("Macropad LED strip unavailable (rc=%d)", rc);
 	}
 
 	rc = battery_monitor_init();
@@ -581,7 +688,7 @@ int main(void)
 	}
 
 	radio_identity_log_esb_config(&addr_config, rf_channel);
-	rc = radio_esb_init(&addr_config, rf_channel, handle_radio_delivery);
+	rc = radio_esb_init(&addr_config, rf_channel, handle_radio_delivery, handle_radio_config);
 	if (rc != 0) {
 		LOG_ERR("radio_esb_init failed: %d", rc);
 		return 0;
@@ -594,6 +701,21 @@ int main(void)
 	}
 	if (rc == -ENOTSUP) {
 		LOG_INF("Encoder input disabled");
+	}
+
+	rc = macropad_keys_init(handle_macropad_keys);
+	if ((rc != 0) && (rc != -ENOTSUP)) {
+		LOG_ERR("macropad_keys_init failed: %d", rc);
+		return 0;
+	}
+	if (rc == -ENOTSUP) {
+		LOG_INF("Macropad keys disabled");
+	} else {
+		macropad_input_state.keys = macropad_keys_get_pressed_mask();
+		rc = update_macropad_key_leds(macropad_input_state.keys);
+		if (rc != 0) {
+			LOG_WRN("Failed to initialize macropad LEDs: %d", rc);
+		}
 	}
 
 	rc = radio_esb_start();
@@ -699,6 +821,7 @@ int main(void)
 			}
 		} else if (event.type == APP_EVENT_ENCODER_BUTTON) {
 			macropad_input_state.encoder_pressed = event.pressed;
+			set_buzzer(event.pressed != 0U);
 			rc = macropad_send_report();
 			if (rc != 0) {
 				LOG_ERR("macropad_send_report failed: %d", rc);
@@ -710,6 +833,30 @@ int main(void)
 
 			ui_state.value = -ui_state.value;
 			redraw = true;
+		} else if (event.type == APP_EVENT_MACROPAD_KEYS) {
+			macropad_input_state.keys = event.keys;
+			rc = update_macropad_key_leds(macropad_input_state.keys);
+			if (rc != 0) {
+				LOG_WRN("Failed to update macropad LEDs: %d", rc);
+			}
+			rc = macropad_send_report();
+			if (rc != 0) {
+				LOG_ERR("macropad_send_report failed: %d", rc);
+			}
+
+			if (event.pressed == 0U) {
+				continue;
+			}
+
+			pulse_status_led(INPUT_ACTIVITY_LED_PULSE_MS);
+			ui_state.value += 1;
+			redraw = true;
+		} else if (event.type == APP_EVENT_MACROPAD_CONFIG) {
+			apply_macropad_key_config(&event.config);
+			rc = update_macropad_key_leds(macropad_input_state.keys);
+			if (rc != 0) {
+				LOG_WRN("Failed to apply macropad config: %d", rc);
+			}
 		} else if (event.type == APP_EVENT_TX_RESULT) {
 			if (handle_tx_result_event(&ui_state, &event, now_ms)) {
 				redraw = true;
