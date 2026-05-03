@@ -18,15 +18,15 @@ static bool stored_config_loaded;
 static void macropad_config_default(macropad_config_t *config)
 {
 	memset(config, 0, sizeof(*config));
-	config->kind = MACROPAD_CONFIG_KIND_KEY_COLORS;
-	for (size_t index = 0; index < WIRE_PROTOCOL_KEY_COUNT; ++index) {
+	config->kind = HPAD_PROTOCOL_CONFIG_KIND_KEY_COLORS;
+	for (size_t index = 0; index < HPAD_PROTOCOL_KEY_COUNT; ++index) {
 		config->keys[index].brightness = UINT8_MAX;
 	}
 }
 
 static bool macropad_config_valid(const macropad_config_t *config)
 {
-	return (config != NULL) && (config->kind == MACROPAD_CONFIG_KIND_KEY_COLORS);
+	return (config != NULL) && (config->kind == HPAD_PROTOCOL_CONFIG_KIND_KEY_COLORS);
 }
 
 static int macropad_config_settings_set(const char *name, size_t len_rd,
@@ -112,7 +112,7 @@ int macropad_config_store(const macropad_config_t *config)
 	}
 
 	next_config = *config;
-	next_config.kind = MACROPAD_CONFIG_KIND_KEY_COLORS;
+	next_config.kind = HPAD_PROTOCOL_CONFIG_KIND_KEY_COLORS;
 	if (memcmp(&stored_config, &next_config, sizeof(next_config)) == 0) {
 		return 0;
 	}

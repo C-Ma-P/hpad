@@ -8,59 +8,26 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <zephyr/drivers/adc.h>
-#include <zephyr/device.h>
-#include <zephyr/display/cfb.h>
-#include <zephyr/dt-bindings/adc/nrf-saadc.h>
-#include <zephyr/drivers/display.h>
-#include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/led_strip.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
-#include <hal/nrf_power.h>
-
+#include "battery.h"
 #include "encoder.h"
+#include "key_leds.h"
 #include "macropad_config.h"
 #include "macropad_keys.h"
 #include "radio_esb.h"
+#include "status_display.h"
+#include "status_io.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-#define DISPLAY_NODE DT_CHOSEN(zephyr_display)
-#define DISPLAY_ICON_X 0U
-#define DISPLAY_STATUS_Y 0U
-#define DISPLAY_ACK_X 24U
-#define DISPLAY_CHARGING_X 88U
-#define DISPLAY_VALUE_X 0U
-#define DISPLAY_VALUE_Y 16U
-#define DISPLAY_CONNECTED_ICON "[+]"
-#define DISPLAY_DISCONNECTED_ICON "[x]"
-#define DISPLAY_ACK_TEXT "ACK"
-#define DISPLAY_CHARGING_TEXT "USB"
-#define DISPLAY_REFRESH_INTERVAL_MS 40
 #define ACK_VISIBLE_MS 50
 #define HEARTBEAT_INTERVAL_MS 1000
 #define CONNECTION_TIMEOUT_MS 2500
 #define INPUT_ACTIVITY_LED_PULSE_MS 80
 #define APP_EVENT_QUEUE_LEN 8
-#define BATTERY_ADC_CHANNEL_ID 0U
-#define BATTERY_ADC_RESOLUTION 14U
-#define BATTERY_ADC_OVERSAMPLING 4U
-#define LED_STRIP_NODE DT_ALIAS(led_strip)
 
-#if DT_NODE_EXISTS(LED_STRIP_NODE) && DT_NODE_HAS_STATUS(LED_STRIP_NODE, okay)
-#define HAVE_MACROPAD_LED_STRIP 1
-#define MACROPAD_LED_STRIP_LENGTH DT_PROP(LED_STRIP_NODE, chain_length)
-static const struct device *const macropad_led_strip = DEVICE_DT_GET(LED_STRIP_NODE);
-static struct led_rgb macropad_led_strip_pixels[MACROPAD_LED_STRIP_LENGTH];
-#else
-#define HAVE_MACROPAD_LED_STRIP 0
-#endif
-
-static const struct device *const display = DEVICE_DT_GET(DISPLAY_NODE);
-static const struct device *const battery_adc = DEVICE_DT_GET(DT_NODELABEL(adc));
 static struct k_spinlock input_state_lock;
 
 enum app_event_type {
@@ -84,7 +51,7 @@ struct app_event {
 
 struct app_ui_state {
 	bool connected;
-	bool charging;
+	bool usb_power_present;
 	bool show_ack;
 	int64_t ack_visible_until_ms;
 	int64_t last_delivery_success_ms;
@@ -96,180 +63,14 @@ struct macropad_input_state {
 	int8_t encoder_delta;
 	uint8_t encoder_pressed;
 	uint16_t battery_mv;
-	uint8_t charging;
+	uint8_t usb_power_present;
 };
 
 K_MSGQ_DEFINE(app_event_queue, sizeof(struct app_event), APP_EVENT_QUEUE_LEN, 4);
 
 static struct macropad_input_state macropad_input_state;
-static struct k_work_delayable status_led_off_work;
 static int32_t pending_encoder_delta;
 static bool encoder_delta_event_pending;
-static bool battery_monitor_ready;
-static int16_t battery_sample_raw;
-static struct adc_channel_cfg battery_channel_cfg = {
-	.gain = ADC_GAIN_1_6,
-	.reference = ADC_REF_INTERNAL,
-	.acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40),
-	.channel_id = BATTERY_ADC_CHANNEL_ID,
-	.input_positive = NRF_SAADC_VDDHDIV5,
-};
-static struct adc_sequence battery_sequence = {
-	.channels = BIT(BATTERY_ADC_CHANNEL_ID),
-	.buffer = &battery_sample_raw,
-	.buffer_size = sizeof(battery_sample_raw),
-	.oversampling = BATTERY_ADC_OVERSAMPLING,
-	.calibrate = true,
-	.resolution = BATTERY_ADC_RESOLUTION,
-};
-
-#if DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
-static const struct gpio_dt_spec status_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-#define HAVE_STATUS_LED 1
-#else
-#define HAVE_STATUS_LED 0
-#endif
-
-#if DT_NODE_HAS_STATUS(DT_ALIAS(buzzer), okay)
-static const struct gpio_dt_spec buzzer = GPIO_DT_SPEC_GET(DT_ALIAS(buzzer), gpios);
-#define HAVE_BUZZER 1
-#else
-#define HAVE_BUZZER 0
-#endif
-
-static void set_status_led(bool on)
-{
-#if HAVE_STATUS_LED
-	gpio_pin_set_dt(&status_led, on);
-#else
-	ARG_UNUSED(on);
-#endif
-}
-
-static void status_led_off_work_handler(struct k_work *work)
-{
-	ARG_UNUSED(work);
-	set_status_led(false);
-}
-
-static void blink_status_led(uint8_t count, uint32_t pulse_ms, uint32_t gap_ms)
-{
-	for (uint8_t idx = 0; idx < count; ++idx) {
-		set_status_led(true);
-		k_msleep(pulse_ms);
-		set_status_led(false);
-		k_msleep(gap_ms);
-	}
-}
-
-static void pulse_status_led(uint32_t pulse_ms)
-{
-#if HAVE_STATUS_LED
-	set_status_led(true);
-	(void)k_work_reschedule(&status_led_off_work, K_MSEC(pulse_ms));
-#else
-	ARG_UNUSED(pulse_ms);
-#endif
-}
-
-static int setup_status_led(void)
-{
-#if HAVE_STATUS_LED
-	if (!gpio_is_ready_dt(&status_led)) {
-		return -ENODEV;
-	}
-
-	k_work_init_delayable(&status_led_off_work, status_led_off_work_handler);
-
-	return gpio_pin_configure_dt(&status_led, GPIO_OUTPUT_INACTIVE);
-#else
-	return -ENOTSUP;
-#endif
-}
-
-static int setup_buzzer(void)
-{
-#if HAVE_BUZZER
-	if (!gpio_is_ready_dt(&buzzer)) {
-		return -ENODEV;
-	}
-
-	return gpio_pin_configure_dt(&buzzer, GPIO_OUTPUT_INACTIVE);
-#else
-	return -ENOTSUP;
-#endif
-}
-
-static void set_buzzer(bool on)
-{
-#if HAVE_BUZZER
-	gpio_pin_set_dt(&buzzer, on ? 1 : 0);
-#else
-	ARG_UNUSED(on);
-#endif
-}
-
-static uint8_t scale_led_channel(uint8_t value, uint8_t brightness)
-{
-	return (uint8_t)(((uint16_t)value * (uint16_t)brightness + 127U) / 255U);
-}
-
-static int update_macropad_key_leds(uint8_t keys)
-{
-#if HAVE_MACROPAD_LED_STRIP
-	const macropad_config_t *config = macropad_config_get();
-
-	for (size_t index = 0; index < MACROPAD_LED_STRIP_LENGTH; ++index) {
-		struct led_rgb color = { 0 };
-
-		if ((index < WIRE_PROTOCOL_KEY_COUNT) && ((keys & BIT(index)) != 0U)) {
-			const macropad_key_led_config_t *key_config = &config->keys[index];
-
-			color = (struct led_rgb){
-				.r = scale_led_channel(key_config->r, key_config->brightness),
-				.g = scale_led_channel(key_config->g, key_config->brightness),
-				.b = scale_led_channel(key_config->b, key_config->brightness),
-			};
-		}
-
-		macropad_led_strip_pixels[index] = color;
-	}
-
-	return led_strip_update_rgb(macropad_led_strip,
-					macropad_led_strip_pixels,
-					MACROPAD_LED_STRIP_LENGTH);
-#else
-	ARG_UNUSED(keys);
-	return -ENOTSUP;
-#endif
-}
-
-static int setup_macropad_led_strip(void)
-{
-#if HAVE_MACROPAD_LED_STRIP
-	if (!device_is_ready(macropad_led_strip)) {
-		return -ENODEV;
-	}
-
-	return update_macropad_key_leds(0U);
-#else
-	return -ENOTSUP;
-#endif
-}
-
-static void apply_macropad_key_config(const macropad_config_t *config)
-{
-	int rc;
-
-	if ((config == NULL) || (config->kind != MACROPAD_CONFIG_KIND_KEY_COLORS)) {
-		return;
-	}
-
-	rc = macropad_config_store(config);
-	if (rc != 0) {
-		LOG_WRN("Failed to persist macropad LED config: %d", rc);
-	}
-}
 
 static int app_queue_event(const struct app_event *event)
 {
@@ -282,121 +83,10 @@ static int app_queue_event(const struct app_event *event)
 	return rc;
 }
 
-static int render_status_display(const struct app_ui_state *state)
-{
-	int rc;
-	char value_text[16];
-	const char *icon = state->connected ? DISPLAY_CONNECTED_ICON : DISPLAY_DISCONNECTED_ICON;
-
-	(void)snprintf(value_text, sizeof(value_text), "%ld", (long)state->value);
-
-	rc = cfb_framebuffer_clear(display, false);
-	if (rc != 0) {
-		LOG_ERR("cfb_framebuffer_clear failed: %d", rc);
-		return rc;
-	}
-
-	rc = cfb_print(display, icon, DISPLAY_ICON_X, DISPLAY_STATUS_Y);
-	if (rc != 0) {
-		LOG_ERR("cfb_print icon failed: %d", rc);
-		return rc;
-	}
-
-	if (state->show_ack) {
-		rc = cfb_print(display, DISPLAY_ACK_TEXT, DISPLAY_ACK_X, DISPLAY_STATUS_Y);
-		if (rc != 0) {
-			LOG_ERR("cfb_print ACK failed: %d", rc);
-			return rc;
-		}
-	}
-
-	if (state->charging) {
-		rc = cfb_print(display, DISPLAY_CHARGING_TEXT, DISPLAY_CHARGING_X, DISPLAY_STATUS_Y);
-		if (rc != 0) {
-			LOG_ERR("cfb_print charging failed: %d", rc);
-			return rc;
-		}
-	}
-
-	rc = cfb_print(display, value_text, DISPLAY_VALUE_X, DISPLAY_VALUE_Y);
-	if (rc != 0) {
-		LOG_ERR("cfb_print value failed: %d", rc);
-		return rc;
-	}
-
-	rc = cfb_framebuffer_finalize(display);
-	if (rc != 0) {
-		LOG_ERR("cfb_framebuffer_finalize failed: %d", rc);
-	}
-
-	return rc;
-}
-
-static bool battery_is_charging(void)
-{
-	return nrf_power_usbregstatus_vbusdet_get(NRF_POWER);
-}
-
-static int battery_monitor_init(void)
-{
-	int rc;
-
-	if (!device_is_ready(battery_adc)) {
-		LOG_WRN("Battery ADC not ready");
-		return -ENODEV;
-	}
-
-	rc = adc_channel_setup(battery_adc, &battery_channel_cfg);
-	if (rc != 0) {
-		LOG_ERR("Battery ADC channel setup failed: %d", rc);
-		return rc;
-	}
-
-	battery_monitor_ready = true;
-	return 0;
-}
-
-static uint16_t battery_sample_mv(void)
-{
-	int rc;
-	int32_t sample_mv;
-
-	if (!battery_monitor_ready) {
-		return 0U;
-	}
-
-	rc = adc_read(battery_adc, &battery_sequence);
-	battery_sequence.calibrate = false;
-	if (rc != 0) {
-		LOG_WRN("Battery ADC read failed: %d", rc);
-		return 0U;
-	}
-
-	sample_mv = battery_sample_raw;
-	rc = adc_raw_to_millivolts(adc_ref_internal(battery_adc),
-		battery_channel_cfg.gain,
-		battery_sequence.resolution,
-		&sample_mv);
-	if (rc != 0) {
-		LOG_WRN("Battery ADC conversion failed: %d", rc);
-		return 0U;
-	}
-
-	sample_mv *= 5;
-	if (sample_mv <= 0) {
-		return 0U;
-	}
-	if (sample_mv > UINT16_MAX) {
-		return UINT16_MAX;
-	}
-
-	return (uint16_t)sample_mv;
-}
-
 static void refresh_battery_state(struct macropad_input_state *state)
 {
 	state->battery_mv = battery_sample_mv();
-	state->charging = battery_is_charging() ? 1U : 0U;
+	state->usb_power_present = status_usb_power_present() ? 1U : 0U;
 }
 
 static int macropad_send_report(void)
@@ -409,7 +99,7 @@ static int macropad_send_report(void)
 		.encoder_delta = macropad_input_state.encoder_delta,
 		.encoder_pressed = macropad_input_state.encoder_pressed,
 		.battery_mv = macropad_input_state.battery_mv,
-		.charging = macropad_input_state.charging,
+		.usb_power_present = macropad_input_state.usb_power_present,
 	};
 
 	return radio_esb_send_macropad_report(&report);
@@ -425,7 +115,7 @@ static int macropad_send_heartbeat(void)
 
 	refresh_battery_state(&macropad_input_state);
 	report.battery_mv = macropad_input_state.battery_mv;
-	report.charging = macropad_input_state.charging;
+	report.usb_power_present = macropad_input_state.usb_power_present;
 
 	return radio_esb_send_heartbeat(&report);
 }
@@ -433,10 +123,9 @@ static int macropad_send_heartbeat(void)
 static int send_encoder_delta_reports(int32_t total_delta)
 {
 	int rc = 0;
+	int8_t step_delta;
 
 	while (total_delta != 0) {
-		int8_t step_delta;
-
 		if (total_delta > INT8_MAX) {
 			step_delta = INT8_MAX;
 		} else if (total_delta < INT8_MIN) {
@@ -541,10 +230,10 @@ static void handle_radio_config(const macropad_config_t *config)
 static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 {
 	bool dirty = false;
-	bool charging = battery_is_charging();
+	bool usb_power_present = status_usb_power_present();
 
-	if (state->charging != charging) {
-		state->charging = charging;
+	if (state->usb_power_present != usb_power_present) {
+		state->usb_power_present = usb_power_present;
 		dirty = true;
 	}
 
@@ -594,7 +283,7 @@ int main(void)
 	struct app_event event;
 	struct app_ui_state ui_state = {
 		.connected = false,
-		.charging = false,
+		.usb_power_present = false,
 		.show_ack = false,
 		.ack_visible_until_ms = 0,
 		.last_delivery_success_ms = INT64_MIN,
@@ -607,14 +296,14 @@ int main(void)
 	bool redraw = true;
 	int rc;
 
-	rc = setup_status_led();
+	rc = status_led_init();
 	if (rc == 0) {
-		blink_status_led(1, 120, 120);
+		status_led_blink(1, 120, 120);
 	} else {
 		LOG_INF("Status LED unavailable (rc=%d)", rc);
 	}
 
-	rc = setup_buzzer();
+	rc = status_buzzer_init();
 	if (rc != 0) {
 		LOG_INF("Buzzer unavailable (rc=%d)", rc);
 	}
@@ -624,46 +313,26 @@ int main(void)
 		LOG_INF("Macropad LED config unavailable (rc=%d)", rc);
 	}
 
-	rc = setup_macropad_led_strip();
+	rc = key_leds_init();
 	if (rc != 0) {
 		LOG_INF("Macropad LED strip unavailable (rc=%d)", rc);
 	}
 
-	rc = battery_monitor_init();
+	rc = battery_init();
 	if (rc != 0) {
 		LOG_INF("Battery monitor unavailable (rc=%d)", rc);
 	}
-	ui_state.charging = battery_is_charging();
+	ui_state.usb_power_present = status_usb_power_present();
 
 	LOG_INF("boot: entering main()");
-	if (!device_is_ready(display)) {
-		LOG_ERR("Display device not ready");
-		return 0;
-	}
-
-	rc = display_set_pixel_format(display, PIXEL_FORMAT_MONO10);
-	if (rc != 0) {
-		rc = display_set_pixel_format(display, PIXEL_FORMAT_MONO01);
-	}
-	LOG_INF("display_set_pixel_format() -> %d", rc);
-	if (rc != 0) {
-		return 0;
-	}
-
-	rc = display_blanking_off(display);
-	LOG_INF("display_blanking_off() -> %d", rc);
-	if ((rc != 0) && (rc != -ENOSYS)) {
-		return 0;
-	}
-
-	rc = cfb_framebuffer_init(display);
-	LOG_INF("cfb_framebuffer_init() -> %d", rc);
+	rc = status_display_init();
 	if (rc != 0) {
 		return 0;
 	}
 
 	k_msleep(1000);
-	rc = render_status_display(&ui_state);
+	rc = status_display_render(ui_state.connected, ui_state.show_ack,
+		ui_state.usb_power_present, ui_state.value);
 	if (rc != 0) {
 		return 0;
 	}
@@ -712,7 +381,7 @@ int main(void)
 		LOG_INF("Macropad keys disabled");
 	} else {
 		macropad_input_state.keys = macropad_keys_get_pressed_mask();
-		rc = update_macropad_key_leds(macropad_input_state.keys);
+		rc = key_leds_update(macropad_input_state.keys);
 		if (rc != 0) {
 			LOG_WRN("Failed to initialize macropad LEDs: %d", rc);
 		}
@@ -744,8 +413,9 @@ int main(void)
 		}
 
 		if (redraw && ((last_display_update_ms == INT64_MIN) ||
-			      ((now_ms - last_display_update_ms) >= DISPLAY_REFRESH_INTERVAL_MS))) {
-			rc = render_status_display(&ui_state);
+			      ((now_ms - last_display_update_ms) >= STATUS_DISPLAY_REFRESH_INTERVAL_MS))) {
+			rc = status_display_render(ui_state.connected, ui_state.show_ack,
+				ui_state.usb_power_present, ui_state.value);
 			if (rc != 0) {
 				LOG_ERR("Display update failed: %d", rc);
 			}
@@ -759,7 +429,7 @@ int main(void)
 			int64_t display_wait_ms = 0;
 
 			if (last_display_update_ms != INT64_MIN) {
-				display_wait_ms = DISPLAY_REFRESH_INTERVAL_MS -
+				display_wait_ms = STATUS_DISPLAY_REFRESH_INTERVAL_MS -
 					(now_ms - last_display_update_ms);
 				if (display_wait_ms < 0) {
 					display_wait_ms = 0;
@@ -811,7 +481,7 @@ int main(void)
 				continue;
 			}
 
-			pulse_status_led(INPUT_ACTIVITY_LED_PULSE_MS);
+			status_led_pulse(INPUT_ACTIVITY_LED_PULSE_MS);
 			ui_state.value += encoder_delta;
 			redraw = true;
 
@@ -821,7 +491,7 @@ int main(void)
 			}
 		} else if (event.type == APP_EVENT_ENCODER_BUTTON) {
 			macropad_input_state.encoder_pressed = event.pressed;
-			set_buzzer(event.pressed != 0U);
+			status_buzzer_set(event.pressed != 0U);
 			rc = macropad_send_report();
 			if (rc != 0) {
 				LOG_ERR("macropad_send_report failed: %d", rc);
@@ -835,7 +505,7 @@ int main(void)
 			redraw = true;
 		} else if (event.type == APP_EVENT_MACROPAD_KEYS) {
 			macropad_input_state.keys = event.keys;
-			rc = update_macropad_key_leds(macropad_input_state.keys);
+			rc = key_leds_update(macropad_input_state.keys);
 			if (rc != 0) {
 				LOG_WRN("Failed to update macropad LEDs: %d", rc);
 			}
@@ -848,12 +518,12 @@ int main(void)
 				continue;
 			}
 
-			pulse_status_led(INPUT_ACTIVITY_LED_PULSE_MS);
+			status_led_pulse(INPUT_ACTIVITY_LED_PULSE_MS);
 			ui_state.value += 1;
 			redraw = true;
 		} else if (event.type == APP_EVENT_MACROPAD_CONFIG) {
-			apply_macropad_key_config(&event.config);
-			rc = update_macropad_key_leds(macropad_input_state.keys);
+			key_leds_apply_config(&event.config);
+			rc = key_leds_update(macropad_input_state.keys);
 			if (rc != 0) {
 				LOG_WRN("Failed to apply macropad config: %d", rc);
 			}

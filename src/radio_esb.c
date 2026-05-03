@@ -228,7 +228,7 @@ static void radio_esb_work_handler(struct k_work *work)
 		}
 
 		memcpy(&config, payload.data, sizeof(config));
-		if ((config.kind == MACROPAD_CONFIG_KIND_KEY_COLORS) && (rx_config_handler != NULL)) {
+		if ((config.kind == HPAD_PROTOCOL_CONFIG_KIND_KEY_COLORS) && (rx_config_handler != NULL)) {
 			rx_config_handler(&config);
 		}
 		memset(&payload, 0, sizeof(payload));
