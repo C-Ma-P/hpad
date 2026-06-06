@@ -38,6 +38,11 @@ static void status_led_off_work_handler(struct k_work *work)
 	set_status_led(false);
 }
 
+void status_led_set(bool on)
+{
+	set_status_led(on);
+}
+
 int status_led_init(void)
 {
 #if HAVE_STATUS_LED

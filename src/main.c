@@ -8,10 +8,14 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/poweroff.h>
 
 #include "battery.h"
+#include "bringup.h"
 #include "encoder.h"
 #include "key_leds.h"
 #include "macropad_config.h"
@@ -27,6 +31,8 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define CONNECTION_TIMEOUT_MS 2500
 #define INPUT_ACTIVITY_LED_PULSE_MS 80
 #define APP_EVENT_QUEUE_LEN 8
+#define DISPLAY_SLEEP_TIMEOUT_MS 30000
+#define BATTERY_CRITICAL_MV 3060U
 
 static struct k_spinlock input_state_lock;
 
@@ -276,8 +282,80 @@ static bool handle_tx_result_event(struct app_ui_state *state, const struct app_
 	return dirty;
 }
 
+/* Raw GPIO smoke test: key pins to GND, LED on P0.15.
+ * Key pins: gpio0: 8,6,22,24,2  gpio1: 0
+ * Press any key -> LED on; release all -> LED off.
+ */
+static int macropad_keys_led_smoke_test(void)
+{
+	const struct device *g0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+	const struct device *g1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
+	static const uint8_t g0_key_pins[] = {8U, 6U, 22U, 24U, 2U};
+	uint32_t log_ctr = 0U;
+
+	if (!device_is_ready(g0) || !device_is_ready(g1)) {
+		LOG_ERR("GPIO devices not ready");
+		return 0;
+	}
+
+	/* LED: P0.15, start off */
+	gpio_pin_configure(g0, 15U, GPIO_OUTPUT_INACTIVE);
+
+	/* Blink 3 times to confirm LED is wired and working */
+	for (int i = 0; i < 3; i++) {
+		gpio_pin_set_raw(g0, 15U, 1);
+		k_msleep(300);
+		gpio_pin_set_raw(g0, 15U, 0);
+		k_msleep(300);
+	}
+
+	/* Key inputs: pull-up; button shorts to GND -> raw read = 0 when pressed */
+	for (size_t i = 0U; i < ARRAY_SIZE(g0_key_pins); ++i) {
+		gpio_pin_configure(g0, g0_key_pins[i], GPIO_INPUT | GPIO_PULL_UP);
+	}
+	gpio_pin_configure(g1, 0U, GPIO_INPUT | GPIO_PULL_UP);
+
+	LOG_INF("Raw key smoke test running (pins g0:8,6,22,24,2 g1:0)");
+
+	while (1) {
+		bool any = false;
+
+		for (size_t i = 0U; i < ARRAY_SIZE(g0_key_pins); ++i) {
+			if (gpio_pin_get_raw(g0, g0_key_pins[i]) == 0) {
+				any = true;
+				break;
+			}
+		}
+		if (!any && (gpio_pin_get_raw(g1, 0U) == 0)) {
+			any = true;
+		}
+
+		gpio_pin_set_raw(g0, 15U, any ? 1 : 0);
+
+		/* Log raw pin states every second so we can see what hardware reports */
+		if (++log_ctr >= 100U) {
+			log_ctr = 0U;
+			LOG_INF("raw: g0[8]=%d [6]=%d [22]=%d [24]=%d [2]=%d  g1[0]=%d",
+				gpio_pin_get_raw(g0, 8U),
+				gpio_pin_get_raw(g0, 6U),
+				gpio_pin_get_raw(g0, 22U),
+				gpio_pin_get_raw(g0, 24U),
+				gpio_pin_get_raw(g0, 2U),
+				gpio_pin_get_raw(g1, 0U));
+		}
+
+		k_msleep(10);
+	}
+}
+
 int main(void)
 {
+#if BRINGUP_STAGE > 0
+	return bringup_main();
+#endif
+
+	//return macropad_keys_led_smoke_test();
+
 	struct dongle_identity identity;
 	struct esb_addr_config addr_config;
 	struct app_event event;
@@ -291,8 +369,11 @@ int main(void)
 	};
 	int64_t next_heartbeat_ms = 0;
 	int64_t last_display_update_ms = INT64_MIN;
+	int64_t last_activity_ms = 0;
 	uint8_t rf_channel;
 	bool generated;
+	bool display_available = false;
+	bool display_sleeping = false;
 	bool redraw = true;
 	int rc;
 
@@ -323,18 +404,24 @@ int main(void)
 		LOG_INF("Battery monitor unavailable (rc=%d)", rc);
 	}
 	ui_state.usb_power_present = status_usb_power_present();
+	refresh_battery_state(&macropad_input_state);
 
 	LOG_INF("boot: entering main()");
 	rc = status_display_init();
 	if (rc != 0) {
-		return 0;
-	}
-
-	k_msleep(1000);
-	rc = status_display_render(ui_state.connected, ui_state.show_ack,
-		ui_state.usb_power_present, ui_state.value);
-	if (rc != 0) {
-		return 0;
+		LOG_WRN("Display unavailable during boot (rc=%d), continuing without OLED", rc);
+		redraw = false;
+	} else {
+		display_available = true;
+		k_msleep(1000);
+		rc = status_display_render(ui_state.connected, ui_state.show_ack,
+			ui_state.usb_power_present, ui_state.value,
+			macropad_input_state.battery_mv);
+		if (rc != 0) {
+			LOG_WRN("Initial display render failed (rc=%d), continuing without OLED", rc);
+			display_available = false;
+			redraw = false;
+		}
 	}
 
 	rc = radio_identity_init();
@@ -395,13 +482,25 @@ int main(void)
 
 	LOG_INF("Macropad sender ready");
 	next_heartbeat_ms = k_uptime_get();
+	last_activity_ms = k_uptime_get();
 
 	while (1) {
 		int64_t now_ms = k_uptime_get();
 		int64_t wait_ms;
 
+		bool prev_usb_power = ui_state.usb_power_present;
+
 		if (update_time_driven_ui(&ui_state, now_ms)) {
 			redraw = true;
+		}
+
+		if (ui_state.usb_power_present != prev_usb_power) {
+			last_activity_ms = now_ms;
+			if (display_sleeping && display_available) {
+				(void)status_display_unblank();
+				display_sleeping = false;
+				redraw = true;
+			}
 		}
 
 		if (now_ms >= next_heartbeat_ms) {
@@ -409,23 +508,46 @@ int main(void)
 			if (rc != 0) {
 				LOG_WRN("macropad_send_heartbeat failed: %d", rc);
 			}
+
+			if ((macropad_input_state.battery_mv > 0U) &&
+			    (macropad_input_state.battery_mv < BATTERY_CRITICAL_MV) &&
+			    !macropad_input_state.usb_power_present) {
+				LOG_WRN("Battery critical (%u mV), powering off",
+					macropad_input_state.battery_mv);
+				sys_poweroff();
+			}
+
+			redraw = true;
 			next_heartbeat_ms = now_ms + HEARTBEAT_INTERVAL_MS;
 		}
 
-		if (redraw && ((last_display_update_ms == INT64_MIN) ||
+		if (display_available && !display_sleeping && redraw && ((last_display_update_ms == INT64_MIN) ||
 			      ((now_ms - last_display_update_ms) >= STATUS_DISPLAY_REFRESH_INTERVAL_MS))) {
+			refresh_battery_state(&macropad_input_state);
 			rc = status_display_render(ui_state.connected, ui_state.show_ack,
-				ui_state.usb_power_present, ui_state.value);
+				ui_state.usb_power_present, ui_state.value,
+				macropad_input_state.battery_mv);
 			if (rc != 0) {
-				LOG_ERR("Display update failed: %d", rc);
+				LOG_WRN("Display update failed (rc=%d), disabling OLED", rc);
+				display_available = false;
 			}
 			last_display_update_ms = now_ms;
 			redraw = false;
 		}
 
+		if (!display_available) {
+			redraw = false;
+		}
+
+		if (display_available && !display_sleeping &&
+		    (now_ms - last_activity_ms) >= DISPLAY_SLEEP_TIMEOUT_MS) {
+			(void)status_display_blank();
+			display_sleeping = true;
+		}
+
 		now_ms = k_uptime_get();
 		wait_ms = next_heartbeat_ms - now_ms;
-		if (redraw) {
+		if (display_available && !display_sleeping && redraw) {
 			int64_t display_wait_ms = 0;
 
 			if (last_display_update_ms != INT64_MIN) {
@@ -438,6 +560,17 @@ int main(void)
 
 			if (display_wait_ms < wait_ms) {
 				wait_ms = display_wait_ms;
+			}
+		}
+
+		if (display_available && !display_sleeping) {
+			int64_t sleep_wait_ms = (last_activity_ms + DISPLAY_SLEEP_TIMEOUT_MS) - now_ms;
+
+			if (sleep_wait_ms < 0) {
+				sleep_wait_ms = 0;
+			}
+			if (sleep_wait_ms < wait_ms) {
+				wait_ms = sleep_wait_ms;
 			}
 		}
 
@@ -467,6 +600,19 @@ int main(void)
 		}
 
 		now_ms = k_uptime_get();
+
+		/* Any input event resets the display sleep timer and wakes the display. */
+		if (event.type == APP_EVENT_ENCODER_DELTA ||
+		    event.type == APP_EVENT_ENCODER_BUTTON ||
+		    event.type == APP_EVENT_MACROPAD_KEYS) {
+			last_activity_ms = now_ms;
+			if (display_sleeping && display_available) {
+				(void)status_display_unblank();
+				display_sleeping = false;
+				redraw = true;
+			}
+		}
+
 		if (event.type == APP_EVENT_ENCODER_DELTA) {
 			int32_t encoder_delta;
 			k_spinlock_key_t key;

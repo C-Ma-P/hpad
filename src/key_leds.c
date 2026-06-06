@@ -70,6 +70,31 @@ int key_leds_init(void)
 #endif
 }
 
+int key_leds_set_all(uint8_t r, uint8_t g, uint8_t b)
+{
+#if HAVE_MACROPAD_LED_STRIP
+	const struct led_rgb color = { .r = r, .g = g, .b = b };
+
+	for (size_t index = 0; index < MACROPAD_LED_STRIP_LENGTH; ++index) {
+		macropad_led_strip_pixels[index] = color;
+	}
+
+	return led_strip_update_rgb(macropad_led_strip,
+				    macropad_led_strip_pixels,
+				    MACROPAD_LED_STRIP_LENGTH);
+#else
+	ARG_UNUSED(r);
+	ARG_UNUSED(g);
+	ARG_UNUSED(b);
+	return -ENOTSUP;
+#endif
+}
+
+int key_leds_all_on(void)
+{
+	return key_leds_set_all(64U, 64U, 64U);
+}
+
 void key_leds_apply_config(const macropad_config_t *config)
 {
 	int rc;

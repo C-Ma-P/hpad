@@ -7,6 +7,9 @@
 #define STATUS_DISPLAY_REFRESH_INTERVAL_MS 40
 
 int status_display_init(void);
-int status_display_render(bool connected, bool show_ack, bool usb_power_present, int32_t value);
+int status_display_render(bool connected, bool show_ack, bool usb_power_present, int32_t value,
+			  uint16_t battery_mv);
+int status_display_blank(void);
+int status_display_unblank(void);
 
 #endif

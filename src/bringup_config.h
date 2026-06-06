@@ -1,0 +1,6 @@
+#ifndef HPADV2_BRINGUP_CONFIG_H_
+#define HPADV2_BRINGUP_CONFIG_H_
+
+#define BRINGUP_STAGE 0
+
+#endif
