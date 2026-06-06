@@ -200,7 +200,7 @@ int bringup_main(void)
 	if (rc != 0) {
 		LOG_WRN("bringup s5: status_display_init FAIL (rc=%d)", rc);
 	} else {
-		rc = status_display_render(false, false, false, 0);
+		rc = status_display_render(false, false, 0);
 		if (rc != 0) {
 			LOG_WRN("bringup s5: status_display_render FAIL (rc=%d)", rc);
 		} else {

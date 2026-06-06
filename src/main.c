@@ -26,7 +26,6 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-#define ACK_VISIBLE_MS 50
 #define HEARTBEAT_INTERVAL_MS 1000
 #define CONNECTION_TIMEOUT_MS 2500
 #define INPUT_ACTIVITY_LED_PULSE_MS 80
@@ -46,7 +45,6 @@ enum app_event_type {
 
 struct app_event {
 	uint8_t type;
-	uint8_t tx_kind;
 	uint8_t acked;
 	uint8_t pressed;
 	uint8_t keys;
@@ -58,10 +56,7 @@ struct app_event {
 struct app_ui_state {
 	bool connected;
 	bool usb_power_present;
-	bool show_ack;
-	int64_t ack_visible_until_ms;
 	int64_t last_delivery_success_ms;
-	int32_t value;
 };
 
 struct macropad_input_state {
@@ -214,9 +209,10 @@ static void handle_macropad_keys(uint8_t key_mask, bool pressed, uint8_t keys)
 
 static void handle_radio_delivery(enum radio_esb_tx_kind kind, bool acked)
 {
+	ARG_UNUSED(kind);
+
 	const struct app_event event = {
 		.type = APP_EVENT_TX_RESULT,
-		.tx_kind = (uint8_t)kind,
 		.acked = acked ? 1U : 0U,
 	};
 
@@ -243,11 +239,6 @@ static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 		dirty = true;
 	}
 
-	if (state->show_ack && (now_ms >= state->ack_visible_until_ms)) {
-		state->show_ack = false;
-		dirty = true;
-	}
-
 	if (state->connected &&
 	    (state->last_delivery_success_ms != INT64_MIN) &&
 	    ((now_ms - state->last_delivery_success_ms) >= CONNECTION_TIMEOUT_MS)) {
@@ -266,12 +257,6 @@ static bool handle_tx_result_event(struct app_ui_state *state, const struct app_
 		state->last_delivery_success_ms = now_ms;
 		if (!state->connected) {
 			state->connected = true;
-			dirty = true;
-		}
-
-		if (event->tx_kind == RADIO_ESB_TX_INPUT_REPORT) {
-			state->show_ack = true;
-			state->ack_visible_until_ms = now_ms + ACK_VISIBLE_MS;
 			dirty = true;
 		}
 	} else if (state->connected) {
@@ -362,10 +347,7 @@ int main(void)
 	struct app_ui_state ui_state = {
 		.connected = false,
 		.usb_power_present = false,
-		.show_ack = false,
-		.ack_visible_until_ms = 0,
 		.last_delivery_success_ms = INT64_MIN,
-		.value = 0,
 	};
 	int64_t next_heartbeat_ms = 0;
 	int64_t last_display_update_ms = INT64_MIN;
@@ -414,8 +396,7 @@ int main(void)
 	} else {
 		display_available = true;
 		k_msleep(1000);
-		rc = status_display_render(ui_state.connected, ui_state.show_ack,
-			ui_state.usb_power_present, ui_state.value,
+		rc = status_display_render(ui_state.connected, ui_state.usb_power_present,
 			macropad_input_state.battery_mv);
 		if (rc != 0) {
 			LOG_WRN("Initial display render failed (rc=%d), continuing without OLED", rc);
@@ -524,8 +505,7 @@ int main(void)
 		if (display_available && !display_sleeping && redraw && ((last_display_update_ms == INT64_MIN) ||
 			      ((now_ms - last_display_update_ms) >= STATUS_DISPLAY_REFRESH_INTERVAL_MS))) {
 			refresh_battery_state(&macropad_input_state);
-			rc = status_display_render(ui_state.connected, ui_state.show_ack,
-				ui_state.usb_power_present, ui_state.value,
+			rc = status_display_render(ui_state.connected, ui_state.usb_power_present,
 				macropad_input_state.battery_mv);
 			if (rc != 0) {
 				LOG_WRN("Display update failed (rc=%d), disabling OLED", rc);
@@ -571,13 +551,6 @@ int main(void)
 			}
 			if (sleep_wait_ms < wait_ms) {
 				wait_ms = sleep_wait_ms;
-			}
-		}
-
-		if (ui_state.show_ack) {
-			int64_t ack_wait_ms = ui_state.ack_visible_until_ms - now_ms;
-			if (ack_wait_ms < wait_ms) {
-				wait_ms = ack_wait_ms;
 			}
 		}
 
@@ -628,7 +601,6 @@ int main(void)
 			}
 
 			status_led_pulse(INPUT_ACTIVITY_LED_PULSE_MS);
-			ui_state.value += encoder_delta;
 			redraw = true;
 
 			rc = send_encoder_delta_reports(encoder_delta);
@@ -647,7 +619,6 @@ int main(void)
 				continue;
 			}
 
-			ui_state.value = -ui_state.value;
 			redraw = true;
 		} else if (event.type == APP_EVENT_MACROPAD_KEYS) {
 			macropad_input_state.keys = event.keys;
@@ -665,7 +636,6 @@ int main(void)
 			}
 
 			status_led_pulse(INPUT_ACTIVITY_LED_PULSE_MS);
-			ui_state.value += 1;
 			redraw = true;
 		} else if (event.type == APP_EVENT_MACROPAD_CONFIG) {
 			key_leds_apply_config(&event.config);
