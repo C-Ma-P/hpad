@@ -22,7 +22,7 @@ LOG_MODULE_REGISTER(status_display, LOG_LEVEL_INF);
 #define DISPLAY_DISCONNECTED_TEXT "[x]"
 
 #define BATTERY_ICON_WIDTH 9U
-#define BATTERY_ICON_HEIGHT 7U
+#define BATTERY_ICON_HEIGHT 9U
 #define BOLT_ICON_WIDTH 8U
 #define BOLT_ICON_HEIGHT 9U
 #define USB_ICON_WIDTH 8U
@@ -34,13 +34,15 @@ static uint8_t display_font_width = DISPLAY_DEFAULT_FONT_WIDTH;
 static uint8_t display_font_height = DISPLAY_DEFAULT_FONT_HEIGHT;
 
 static const uint16_t battery_icon_rows[BATTERY_ICON_HEIGHT] = {
-	0x0FCU,
-	0x102U,
-	0x17BU,
-	0x17BU,
-	0x17BU,
-	0x102U,
-	0x0FCU,
+	0x038U,
+	0x0FEU,
+	0x183U,
+	0x1B3U,
+	0x1B3U,
+	0x1B3U,
+	0x1B3U,
+	0x183U,
+	0x0FEU,
 };
 
 static const uint16_t charging_bolt_rows[BOLT_ICON_HEIGHT] = {
@@ -57,10 +59,11 @@ static const uint16_t charging_bolt_rows[BOLT_ICON_HEIGHT] = {
 
 static const uint16_t usb_icon_rows[USB_ICON_HEIGHT] = {
 	0x24U,
-	0x7EU,
-	0x7EU,
-	0x5AU,
-	0x5AU,
+	0x24U,
+	0x3CU,
+	0x3CU,
+	0x18U,
+	0x18U,
 	0x3CU,
 	0x18U,
 	0x18U,
