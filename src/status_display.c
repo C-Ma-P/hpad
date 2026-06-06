@@ -18,11 +18,11 @@ LOG_MODULE_REGISTER(status_display, LOG_LEVEL_INF);
 #define DISPLAY_DEFAULT_WIDTH 128U
 #define DISPLAY_DEFAULT_FONT_WIDTH 8U
 #define DISPLAY_DEFAULT_FONT_HEIGHT 16U
-#define DISPLAY_CONNECTED_TEXT "LINK"
-#define DISPLAY_DISCONNECTED_TEXT "WAIT"
+#define DISPLAY_CONNECTED_TEXT "[+]"
+#define DISPLAY_DISCONNECTED_TEXT "[x]"
 
-#define BATTERY_ICON_WIDTH 8U
-#define BATTERY_ICON_HEIGHT 9U
+#define BATTERY_ICON_WIDTH 9U
+#define BATTERY_ICON_HEIGHT 7U
 #define BOLT_ICON_WIDTH 8U
 #define BOLT_ICON_HEIGHT 9U
 #define USB_ICON_WIDTH 8U
@@ -34,15 +34,13 @@ static uint8_t display_font_width = DISPLAY_DEFAULT_FONT_WIDTH;
 static uint8_t display_font_height = DISPLAY_DEFAULT_FONT_HEIGHT;
 
 static const uint16_t battery_icon_rows[BATTERY_ICON_HEIGHT] = {
-	0x18U,
-	0x18U,
-	0x7EU,
-	0x42U,
-	0x42U,
-	0x42U,
-	0x42U,
-	0x42U,
-	0x7EU,
+	0x0FCU,
+	0x102U,
+	0x17BU,
+	0x17BU,
+	0x17BU,
+	0x102U,
+	0x0FCU,
 };
 
 static const uint16_t charging_bolt_rows[BOLT_ICON_HEIGHT] = {
@@ -158,16 +156,19 @@ int status_display_render(bool connected, bool usb_power_present, uint16_t batte
 	char batt_text[8];
 	uint8_t pct = battery_mv_to_pct(battery_mv);
 	const char *status_text = connected ? DISPLAY_CONNECTED_TEXT : DISPLAY_DISCONNECTED_TEXT;
+	const uint16_t *battery_state_icon = usb_power_present ? charging_bolt_rows : battery_icon_rows;
+	uint8_t battery_state_icon_width = usb_power_present ? BOLT_ICON_WIDTH : BATTERY_ICON_WIDTH;
+	uint8_t battery_state_icon_height = usb_power_present ? BOLT_ICON_HEIGHT : BATTERY_ICON_HEIGHT;
 	uint16_t bottom_group_width = (uint16_t)(DISPLAY_BATTERY_FIELD_DIGITS * display_font_width) +
 		DISPLAY_BATTERY_GROUP_GAP +
-		(usb_power_present ? BOLT_ICON_WIDTH : BATTERY_ICON_WIDTH);
+		battery_state_icon_width;
 	uint16_t bottom_group_x = (display_width_px > bottom_group_width) ?
 		(uint16_t)((display_width_px - bottom_group_width) / 2U) : 0U;
 	uint16_t bottom_icon_x = bottom_group_x +
 		(DISPLAY_BATTERY_FIELD_DIGITS * display_font_width) + DISPLAY_BATTERY_GROUP_GAP;
 	uint16_t bottom_row_y = display_font_height;
 	uint16_t bottom_icon_y = bottom_row_y +
-		((display_font_height - BATTERY_ICON_HEIGHT) / 2U);
+		((display_font_height - battery_state_icon_height) / 2U);
 	uint16_t usb_icon_x = (display_width_px > (USB_ICON_WIDTH + DISPLAY_FRAME_MARGIN_X)) ?
 		(uint16_t)(display_width_px - USB_ICON_WIDTH - DISPLAY_FRAME_MARGIN_X) : 0U;
 	uint16_t usb_icon_y = (display_font_height > USB_ICON_HEIGHT) ?
@@ -202,13 +203,8 @@ int status_display_render(bool connected, bool usb_power_present, uint16_t batte
 		return rc;
 	}
 
-	if (usb_power_present) {
-		rc = draw_bitmap(bottom_icon_x, bottom_icon_y, BOLT_ICON_WIDTH, BOLT_ICON_HEIGHT,
-			charging_bolt_rows);
-	} else {
-		rc = draw_bitmap(bottom_icon_x, bottom_icon_y, BATTERY_ICON_WIDTH,
-			BATTERY_ICON_HEIGHT, battery_icon_rows);
-	}
+	rc = draw_bitmap(bottom_icon_x, bottom_icon_y, battery_state_icon_width,
+		battery_state_icon_height, battery_state_icon);
 	if (rc != 0) {
 		LOG_ERR("draw battery state icon failed: %d", rc);
 		return rc;
