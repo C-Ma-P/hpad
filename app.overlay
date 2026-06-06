@@ -1,4 +1,5 @@
 #include <zephyr/dt-bindings/led/led.h>
+#include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
 
 / {
 	chosen {
@@ -53,7 +54,7 @@
 
 		//  good
 		macro_key_4: macro_key_4 {
-			gpios = <&gpio1 0 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			gpios = <&gpio0 8 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
 			label = "Macro Key 4";
 		};
 
@@ -94,6 +95,13 @@
 		output-low;
 		line-name = "peripheral-vcc-enable";
 	};
+
+	led_pwr_enable: led_pwr_enable {
+		gpio-hog;
+		gpios = <11 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "led-pwr-enable";
+	};
 };
 
 &pinctrl {
@@ -117,6 +125,7 @@
 		group1 {
 			psels = <NRF_PSEL(SPIM_SCK, 1, 13)>,
 				<NRF_PSEL(SPIM_MOSI, 1, 15)>;
+			nordic,drive-mode = <NRF_DRIVE_H0H1>;
 		};
 	};
 
@@ -152,8 +161,6 @@
 		page-offset = <0>;
 		display-offset = <0>;
 		multiplex-ratio = <31>;
-		segment-remap;
-		com-invdir;
 		com-sequential;
 		prechargep = <0xf1>;
 		ready-time-ms = <100>;
@@ -175,5 +182,6 @@
 		color-mapping = <LED_COLOR_ID_GREEN LED_COLOR_ID_RED LED_COLOR_ID_BLUE>;
 		spi-one-frame = <0x70>;
 		spi-zero-frame = <0x40>;
+		reset-delay = <80>;
 	};
 };

@@ -115,17 +115,18 @@ static void encoder_gpio_handler(const struct device *port, struct gpio_callback
 static void encoder_button_work_handler(struct k_work *work)
 {
 	bool pressed;
-	int state;
+	int raw_state;
 
 	ARG_UNUSED(work);
 
-	state = gpio_pin_get_dt(&encoder_button);
-	if (state < 0) {
-		LOG_ERR("Failed to sample encoder button: %d", state);
+	raw_state = gpio_pin_get_raw(encoder_button.port, encoder_button.pin);
+	if (raw_state < 0) {
+		LOG_ERR("Failed to sample encoder button: %d", raw_state);
 		return;
 	}
 
-	pressed = (state != 0);
+	/* Encoder switch is wired to short the pin to GND when pressed. */
+	pressed = (raw_state == 0);
 	if (pressed != encoder_button_pressed) {
 		encoder_button_pressed = pressed;
 		encoder_emit_button(pressed);
@@ -170,7 +171,8 @@ int encoder_init(encoder_delta_callback_t delta_callback,
 		return rc;
 	}
 
-	rc = gpio_pin_configure_dt(&encoder_button, GPIO_INPUT);
+	rc = gpio_pin_configure(encoder_button.port, encoder_button.pin,
+				       GPIO_INPUT | GPIO_PULL_UP);
 	if (rc != 0) {
 		LOG_ERR("Failed to configure encoder button: %d", rc);
 		return rc;
@@ -217,7 +219,8 @@ int encoder_init(encoder_delta_callback_t delta_callback,
 		return rc;
 	}
 
-	rc = gpio_pin_interrupt_configure_dt(&encoder_button, GPIO_INT_EDGE_BOTH);
+	rc = gpio_pin_interrupt_configure(encoder_button.port, encoder_button.pin,
+				        GPIO_INT_EDGE_BOTH);
 	if (rc != 0) {
 		LOG_ERR("Failed to configure encoder button interrupt: %d", rc);
 		return rc;

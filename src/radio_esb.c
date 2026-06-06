@@ -167,7 +167,7 @@ static int radio_esb_send_report(enum radio_esb_tx_kind kind,
 		return rc;
 	}
 
-	LOG_INF("Queued report kind=%u keys=0x%02x enc_delta=%d enc_pressed=%u",
+	LOG_DBG("Queued report kind=%u keys=0x%02x enc_delta=%d enc_pressed=%u",
 		kind, report->keys, report->encoder_delta, report->encoder_pressed);
 	return 0;
 }
@@ -187,7 +187,7 @@ static void radio_esb_work_handler(struct k_work *work)
 	if ((events & RADIO_EVENT_TX_SUCCESS_FLAG) != 0) {
 		dequeued = radio_esb_pop_tx_kind(&kind);
 		if (dequeued) {
-			LOG_INF("Report delivery acknowledged for kind=%u", kind);
+			LOG_DBG("Report delivery acknowledged for kind=%u", kind);
 			if (tx_delivery_handler != NULL) {
 				tx_delivery_handler(kind, true);
 			}

@@ -6,6 +6,8 @@
 #include "wire_protocol.h"
 
 int key_leds_init(void);
+int key_leds_set_all(uint8_t r, uint8_t g, uint8_t b);
+int key_leds_all_on(void);
 int key_leds_update(uint8_t keys);
 void key_leds_apply_config(const macropad_config_t *config);
 

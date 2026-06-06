@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 int status_led_init(void);
+void status_led_set(bool on);
 void status_led_blink(uint8_t count, uint32_t pulse_ms, uint32_t gap_ms);
 void status_led_pulse(uint32_t pulse_ms);
 

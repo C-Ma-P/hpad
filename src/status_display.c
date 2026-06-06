@@ -14,15 +14,28 @@ LOG_MODULE_REGISTER(status_display, LOG_LEVEL_INF);
 #define DISPLAY_ICON_X 0U
 #define DISPLAY_STATUS_Y 0U
 #define DISPLAY_ACK_X 24U
-#define DISPLAY_USB_POWER_X 88U
+#define DISPLAY_BATT_X 88U
+#define DISPLAY_BATT_Y 0U
 #define DISPLAY_VALUE_X 0U
 #define DISPLAY_VALUE_Y 16U
 #define DISPLAY_CONNECTED_ICON "[+]"
 #define DISPLAY_DISCONNECTED_ICON "[x]"
 #define DISPLAY_ACK_TEXT "ACK"
-#define DISPLAY_USB_POWER_TEXT "USB"
 
 static const struct device *const display = DEVICE_DT_GET(DISPLAY_NODE);
+
+#define BATTERY_WARNING_PCT 20U
+
+static uint8_t battery_mv_to_pct(uint16_t mv)
+{
+	if (mv >= 4200U) {
+		return 100U;
+	}
+	if (mv <= 3000U) {
+		return 0U;
+	}
+	return (uint8_t)((uint32_t)(mv - 3000U) * 100U / 1200U);
+}
 
 int status_display_init(void)
 {
@@ -57,13 +70,23 @@ int status_display_init(void)
 	return 0;
 }
 
-int status_display_render(bool connected, bool show_ack, bool usb_power_present, int32_t value)
+int status_display_render(bool connected, bool show_ack, bool usb_power_present, int32_t value,
+			  uint16_t battery_mv)
 {
 	int rc;
 	char value_text[16];
+	char batt_text[8];
+	uint8_t pct = battery_mv_to_pct(battery_mv);
 	const char *icon = connected ? DISPLAY_CONNECTED_ICON : DISPLAY_DISCONNECTED_ICON;
 
 	(void)snprintf(value_text, sizeof(value_text), "%ld", (long)value);
+	if (usb_power_present) {
+		(void)snprintf(batt_text, sizeof(batt_text), "+%u%%", pct);
+	} else if (pct < BATTERY_WARNING_PCT) {
+		(void)snprintf(batt_text, sizeof(batt_text), "!%u%%", pct);
+	} else {
+		(void)snprintf(batt_text, sizeof(batt_text), "%u%%", pct);
+	}
 
 	rc = cfb_framebuffer_clear(display, false);
 	if (rc != 0) {
@@ -85,12 +108,10 @@ int status_display_render(bool connected, bool show_ack, bool usb_power_present,
 		}
 	}
 
-	if (usb_power_present) {
-		rc = cfb_print(display, DISPLAY_USB_POWER_TEXT, DISPLAY_USB_POWER_X, DISPLAY_STATUS_Y);
-		if (rc != 0) {
-			LOG_ERR("cfb_print USB power failed: %d", rc);
-			return rc;
-		}
+	rc = cfb_print(display, batt_text, DISPLAY_BATT_X, DISPLAY_BATT_Y);
+	if (rc != 0) {
+		LOG_ERR("cfb_print battery failed: %d", rc);
+		return rc;
 	}
 
 	rc = cfb_print(display, value_text, DISPLAY_VALUE_X, DISPLAY_VALUE_Y);
@@ -105,4 +126,14 @@ int status_display_render(bool connected, bool show_ack, bool usb_power_present,
 	}
 
 	return rc;
+}
+
+int status_display_blank(void)
+{
+	return display_blanking_on(display);
+}
+
+int status_display_unblank(void)
+{
+	return display_blanking_off(display);
 }
