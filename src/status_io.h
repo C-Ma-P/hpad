@@ -13,5 +13,6 @@ int status_buzzer_init(void);
 void status_buzzer_set(bool on);
 
 bool status_usb_power_present(void);
+int status_power_rails_off(void);
 
 #endif

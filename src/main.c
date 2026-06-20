@@ -31,7 +31,13 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define INPUT_ACTIVITY_LED_PULSE_MS 80
 #define APP_EVENT_QUEUE_LEN 8
 #define DISPLAY_SLEEP_TIMEOUT_MS 30000
-#define BATTERY_CRITICAL_MV 3060U
+#define DONGLE_ACTIVITY_PULSE_MS 150
+#define BATTERY_WARNING_MV 3500U
+#define BATTERY_CRITICAL_MV 3400U
+#define BATTERY_POWEROFF_MV 3250U
+#define BATTERY_POWEROFF_CLEAR_MV 3350U
+#define BATTERY_POWEROFF_SUSTAIN_MS 60000
+#define BATTERY_CRITICAL_BLINK_MS 500
 
 static struct k_spinlock input_state_lock;
 
@@ -55,8 +61,15 @@ struct app_event {
 
 struct app_ui_state {
 	bool connected;
+	bool dongle_activity;
 	bool usb_power_present;
+	bool battery_warning_visible;
 	int64_t last_delivery_success_ms;
+};
+
+struct battery_policy_state {
+	uint16_t filtered_mv;
+	int64_t below_poweroff_since_ms;
 };
 
 struct macropad_input_state {
@@ -70,6 +83,10 @@ struct macropad_input_state {
 K_MSGQ_DEFINE(app_event_queue, sizeof(struct app_event), APP_EVENT_QUEUE_LEN, 4);
 
 static struct macropad_input_state macropad_input_state;
+static struct battery_policy_state battery_policy_state = {
+	.filtered_mv = 0U,
+	.below_poweroff_since_ms = INT64_MIN,
+};
 static int32_t pending_encoder_delta;
 static bool encoder_delta_event_pending;
 
@@ -84,10 +101,162 @@ static int app_queue_event(const struct app_event *event)
 	return rc;
 }
 
+static void update_battery_filter(uint16_t battery_mv)
+{
+	if (battery_mv == 0U) {
+		return;
+	}
+
+	if (battery_policy_state.filtered_mv == 0U) {
+		battery_policy_state.filtered_mv = battery_mv;
+		return;
+	}
+
+	battery_policy_state.filtered_mv = (uint16_t)
+		(((uint32_t)battery_policy_state.filtered_mv * 3U + battery_mv + 2U) / 4U);
+}
+
+static void update_battery_policy(uint16_t battery_mv, bool usb_power_present, int64_t now_ms)
+{
+	update_battery_filter(battery_mv);
+
+	if (usb_power_present || (battery_policy_state.filtered_mv == 0U)) {
+		battery_policy_state.below_poweroff_since_ms = INT64_MIN;
+		return;
+	}
+
+	if (battery_policy_state.filtered_mv < BATTERY_POWEROFF_MV) {
+		if (battery_policy_state.below_poweroff_since_ms == INT64_MIN) {
+			battery_policy_state.below_poweroff_since_ms = now_ms;
+		}
+	} else if (battery_policy_state.filtered_mv >= BATTERY_POWEROFF_CLEAR_MV) {
+		battery_policy_state.below_poweroff_since_ms = INT64_MIN;
+	}
+}
+
 static void refresh_battery_state(struct macropad_input_state *state)
 {
+	const bool usb_power_present = status_usb_power_present();
+	const int64_t now_ms = k_uptime_get();
+
 	state->battery_mv = battery_sample_mv();
-	state->usb_power_present = status_usb_power_present() ? 1U : 0U;
+	state->usb_power_present = usb_power_present ? 1U : 0U;
+	update_battery_policy(state->battery_mv, usb_power_present, now_ms);
+}
+
+static bool battery_warning_active(bool usb_power_present)
+{
+	return (battery_policy_state.filtered_mv > 0U) &&
+		(battery_policy_state.filtered_mv <= BATTERY_WARNING_MV) &&
+		!usb_power_present;
+}
+
+static bool battery_critical_active(bool usb_power_present)
+{
+	return (battery_policy_state.filtered_mv > 0U) &&
+		(battery_policy_state.filtered_mv <= BATTERY_CRITICAL_MV) &&
+		!usb_power_present;
+}
+
+static bool battery_warning_visible(bool usb_power_present, int64_t now_ms)
+{
+	if (!battery_warning_active(usb_power_present)) {
+		return false;
+	}
+
+	if (!battery_critical_active(usb_power_present)) {
+		return true;
+	}
+
+	return (((uint64_t)now_ms / BATTERY_CRITICAL_BLINK_MS) & 0x1U) == 0U;
+}
+
+static bool battery_poweroff_required(bool usb_power_present, int64_t now_ms)
+{
+	return !usb_power_present &&
+		(battery_policy_state.filtered_mv > 0U) &&
+		(battery_policy_state.filtered_mv < BATTERY_POWEROFF_MV) &&
+		(battery_policy_state.below_poweroff_since_ms != INT64_MIN) &&
+		((now_ms - battery_policy_state.below_poweroff_since_ms) >=
+			BATTERY_POWEROFF_SUSTAIN_MS);
+}
+
+static uint16_t battery_display_mv(void)
+{
+	if (battery_policy_state.filtered_mv != 0U) {
+		return battery_policy_state.filtered_mv;
+	}
+
+	return macropad_input_state.battery_mv;
+}
+
+static int save_runtime_state(void)
+{
+	return 0;
+}
+
+static void prepare_for_poweroff(bool display_available)
+{
+	int rc;
+
+	status_buzzer_set(false);
+	status_led_set(false);
+
+	rc = key_leds_set_all(0U, 0U, 0U);
+	if ((rc != 0) && (rc != -ENOTSUP)) {
+		LOG_WRN("Failed to shut down key LEDs: %d", rc);
+	}
+
+	if (display_available) {
+		rc = status_display_blank();
+		if ((rc != 0) && (rc != -ENOSYS)) {
+			LOG_WRN("Failed to blank display during poweroff: %d", rc);
+		}
+	}
+
+	rc = status_power_rails_off();
+	if (rc != 0) {
+		LOG_WRN("Failed to disable power rails: %d", rc);
+	}
+
+	rc = save_runtime_state();
+	if (rc != 0) {
+		LOG_WRN("Failed to save runtime state: %d", rc);
+	}
+}
+
+static void enforce_battery_policy(bool usb_power_present,
+				   bool display_available,
+				   bool *warning_logged)
+{
+	const bool warning_active = battery_warning_active(usb_power_present);
+	const int64_t now_ms = k_uptime_get();
+
+	if (warning_active && !(*warning_logged)) {
+		LOG_WRN("Battery low (%u mV filtered)", battery_policy_state.filtered_mv);
+	}
+
+	*warning_logged = warning_active;
+
+	if (battery_poweroff_required(usb_power_present, now_ms)) {
+		LOG_WRN("Battery critical (%u mV filtered for %u ms), entering system-off",
+			battery_policy_state.filtered_mv,
+			(unsigned int)BATTERY_POWEROFF_SUSTAIN_MS);
+		prepare_for_poweroff(display_available);
+		sys_poweroff();
+	}
+}
+
+static struct status_display_state make_display_state(const struct app_ui_state *ui_state)
+{
+	return (struct status_display_state){
+		.connected = ui_state->connected,
+		.dongle_activity = ui_state->dongle_activity,
+		.usb_power_present = ui_state->usb_power_present,
+		.show_battery_warning = ui_state->battery_warning_visible,
+		.battery_mv = battery_display_mv(),
+		.keys_pressed = macropad_input_state.keys,
+	};
 }
 
 static int macropad_send_report(void)
@@ -233,9 +402,15 @@ static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 {
 	bool dirty = false;
 	bool usb_power_present = status_usb_power_present();
+	bool dongle_activity;
+	bool warning_visible;
 
 	if (state->usb_power_present != usb_power_present) {
 		state->usb_power_present = usb_power_present;
+		macropad_input_state.usb_power_present = usb_power_present ? 1U : 0U;
+		if (usb_power_present) {
+			battery_policy_state.below_poweroff_since_ms = INT64_MIN;
+		}
 		dirty = true;
 	}
 
@@ -243,6 +418,20 @@ static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 	    (state->last_delivery_success_ms != INT64_MIN) &&
 	    ((now_ms - state->last_delivery_success_ms) >= CONNECTION_TIMEOUT_MS)) {
 		state->connected = false;
+		dirty = true;
+	}
+
+	dongle_activity = state->connected &&
+		(state->last_delivery_success_ms != INT64_MIN) &&
+		((now_ms - state->last_delivery_success_ms) < DONGLE_ACTIVITY_PULSE_MS);
+	if (state->dongle_activity != dongle_activity) {
+		state->dongle_activity = dongle_activity;
+		dirty = true;
+	}
+
+	warning_visible = battery_warning_visible(usb_power_present, now_ms);
+	if (state->battery_warning_visible != warning_visible) {
+		state->battery_warning_visible = warning_visible;
 		dirty = true;
 	}
 
@@ -259,8 +448,13 @@ static bool handle_tx_result_event(struct app_ui_state *state, const struct app_
 			state->connected = true;
 			dirty = true;
 		}
+		if (!state->dongle_activity) {
+			state->dongle_activity = true;
+			dirty = true;
+		}
 	} else if (state->connected) {
 		state->connected = false;
+		state->dongle_activity = false;
 		dirty = true;
 	}
 
@@ -271,7 +465,7 @@ static bool handle_tx_result_event(struct app_ui_state *state, const struct app_
  * Key pins: gpio0: 8,6,22,24,2  gpio1: 0
  * Press any key -> LED on; release all -> LED off.
  */
-static int macropad_keys_led_smoke_test(void)
+static int __attribute__((unused)) macropad_keys_led_smoke_test(void)
 {
 	const struct device *g0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 	const struct device *g1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
@@ -346,7 +540,9 @@ int main(void)
 	struct app_event event;
 	struct app_ui_state ui_state = {
 		.connected = false,
+		.dongle_activity = false,
 		.usb_power_present = false,
+		.battery_warning_visible = false,
 		.last_delivery_success_ms = INT64_MIN,
 	};
 	int64_t next_heartbeat_ms = 0;
@@ -356,6 +552,7 @@ int main(void)
 	bool generated;
 	bool display_available = false;
 	bool display_sleeping = false;
+	bool battery_warning_logged = false;
 	bool redraw = true;
 	int rc;
 
@@ -387,6 +584,9 @@ int main(void)
 	}
 	ui_state.usb_power_present = status_usb_power_present();
 	refresh_battery_state(&macropad_input_state);
+	ui_state.battery_warning_visible = battery_warning_visible(ui_state.usb_power_present,
+		k_uptime_get());
+	enforce_battery_policy(ui_state.usb_power_present, false, &battery_warning_logged);
 
 	LOG_INF("boot: entering main()");
 	rc = status_display_init();
@@ -394,10 +594,11 @@ int main(void)
 		LOG_WRN("Display unavailable during boot (rc=%d), continuing without OLED", rc);
 		redraw = false;
 	} else {
+		const struct status_display_state display_state = make_display_state(&ui_state);
+
 		display_available = true;
 		k_msleep(1000);
-		rc = status_display_render(ui_state.connected, ui_state.usb_power_present,
-			macropad_input_state.battery_mv);
+		rc = status_display_render(&display_state);
 		if (rc != 0) {
 			LOG_WRN("Initial display render failed (rc=%d), continuing without OLED", rc);
 			display_available = false;
@@ -490,13 +691,8 @@ int main(void)
 				LOG_WRN("macropad_send_heartbeat failed: %d", rc);
 			}
 
-			if ((macropad_input_state.battery_mv > 0U) &&
-			    (macropad_input_state.battery_mv < BATTERY_CRITICAL_MV) &&
-			    !macropad_input_state.usb_power_present) {
-				LOG_WRN("Battery critical (%u mV), powering off",
-					macropad_input_state.battery_mv);
-				sys_poweroff();
-			}
+			enforce_battery_policy(ui_state.usb_power_present, display_available,
+				&battery_warning_logged);
 
 			redraw = true;
 			next_heartbeat_ms = now_ms + HEARTBEAT_INTERVAL_MS;
@@ -504,9 +700,9 @@ int main(void)
 
 		if (display_available && !display_sleeping && redraw && ((last_display_update_ms == INT64_MIN) ||
 			      ((now_ms - last_display_update_ms) >= STATUS_DISPLAY_REFRESH_INTERVAL_MS))) {
-			refresh_battery_state(&macropad_input_state);
-			rc = status_display_render(ui_state.connected, ui_state.usb_power_present,
-				macropad_input_state.battery_mv);
+			const struct status_display_state display_state = make_display_state(&ui_state);
+
+			rc = status_display_render(&display_state);
 			if (rc != 0) {
 				LOG_WRN("Display update failed (rc=%d), disabling OLED", rc);
 				display_available = false;
@@ -519,7 +715,7 @@ int main(void)
 			redraw = false;
 		}
 
-		if (display_available && !display_sleeping &&
+		if (display_available && !display_sleeping && !ui_state.usb_power_present &&
 		    (now_ms - last_activity_ms) >= DISPLAY_SLEEP_TIMEOUT_MS) {
 			(void)status_display_blank();
 			display_sleeping = true;
@@ -543,7 +739,7 @@ int main(void)
 			}
 		}
 
-		if (display_available && !display_sleeping) {
+		if (display_available && !display_sleeping && !ui_state.usb_power_present) {
 			int64_t sleep_wait_ms = (last_activity_ms + DISPLAY_SLEEP_TIMEOUT_MS) - now_ms;
 
 			if (sleep_wait_ms < 0) {
@@ -559,6 +755,24 @@ int main(void)
 				(ui_state.last_delivery_success_ms + CONNECTION_TIMEOUT_MS) - now_ms;
 			if (disconnect_wait_ms < wait_ms) {
 				wait_ms = disconnect_wait_ms;
+			}
+		}
+
+		if (display_available && !display_sleeping && ui_state.dongle_activity &&
+		    (ui_state.last_delivery_success_ms != INT64_MIN)) {
+			int64_t pulse_wait_ms =
+				(ui_state.last_delivery_success_ms + DONGLE_ACTIVITY_PULSE_MS) - now_ms;
+			if (pulse_wait_ms < wait_ms) {
+				wait_ms = pulse_wait_ms;
+			}
+		}
+
+		if (display_available && !display_sleeping &&
+		    battery_critical_active(ui_state.usb_power_present)) {
+			int64_t blink_wait_ms = BATTERY_CRITICAL_BLINK_MS -
+				(now_ms % BATTERY_CRITICAL_BLINK_MS);
+			if (blink_wait_ms < wait_ms) {
+				wait_ms = blink_wait_ms;
 			}
 		}
 
