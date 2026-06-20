@@ -200,7 +200,16 @@ int bringup_main(void)
 	if (rc != 0) {
 		LOG_WRN("bringup s5: status_display_init FAIL (rc=%d)", rc);
 	} else {
-		rc = status_display_render(false, false, false, 0);
+		const struct status_display_state display_state = {
+			.connected = false,
+			.dongle_activity = false,
+			.usb_power_present = false,
+			.show_battery_warning = false,
+			.battery_mv = 0U,
+			.keys_pressed = 0U,
+		};
+
+		rc = status_display_render(&display_state);
 		if (rc != 0) {
 			LOG_WRN("bringup s5: status_display_render FAIL (rc=%d)", rc);
 		} else {

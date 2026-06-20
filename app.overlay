@@ -54,7 +54,7 @@
 
 		//  good
 		macro_key_4: macro_key_4 {
-			gpios = <&gpio0 8 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			gpios = <&gpio1 0 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
 			label = "Macro Key 4";
 		};
 

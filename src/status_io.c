@@ -21,6 +21,29 @@ static const struct gpio_dt_spec buzzer = GPIO_DT_SPEC_GET(DT_ALIAS(buzzer), gpi
 #define HAVE_BUZZER 0
 #endif
 
+#define GPIO_HOG_DT_SPEC_GET(node_id) \
+	{ \
+		.port = DEVICE_DT_GET(DT_PARENT(node_id)), \
+		.pin = DT_PROP_BY_IDX(node_id, gpios, 0), \
+		.dt_flags = DT_PROP_BY_IDX(node_id, gpios, 1), \
+	}
+
+#if DT_NODE_EXISTS(DT_NODELABEL(peripheral_vcc_enable))
+static const struct gpio_dt_spec peripheral_vcc_enable =
+	GPIO_HOG_DT_SPEC_GET(DT_NODELABEL(peripheral_vcc_enable));
+#define HAVE_PERIPHERAL_VCC_ENABLE 1
+#else
+#define HAVE_PERIPHERAL_VCC_ENABLE 0
+#endif
+
+#if DT_NODE_EXISTS(DT_NODELABEL(led_pwr_enable))
+static const struct gpio_dt_spec led_pwr_enable =
+	GPIO_HOG_DT_SPEC_GET(DT_NODELABEL(led_pwr_enable));
+#define HAVE_LED_POWER_ENABLE 1
+#else
+#define HAVE_LED_POWER_ENABLE 0
+#endif
+
 static struct k_work_delayable status_led_off_work;
 
 static void set_status_led(bool on)
@@ -102,4 +125,35 @@ void status_buzzer_set(bool on)
 bool status_usb_power_present(void)
 {
 	return nrf_power_usbregstatus_vbusdet_get(NRF_POWER);
+}
+
+int status_power_rails_off(void)
+{
+	int rc = 0;
+
+#if HAVE_LED_POWER_ENABLE
+	if (gpio_is_ready_dt(&led_pwr_enable)) {
+		rc = gpio_pin_configure_dt(&led_pwr_enable, GPIO_OUTPUT_INACTIVE);
+		if (rc == 0) {
+			rc = gpio_pin_set_dt(&led_pwr_enable, 0);
+		}
+		if (rc != 0) {
+			return rc;
+		}
+	}
+#endif
+
+#if HAVE_PERIPHERAL_VCC_ENABLE
+	if (gpio_is_ready_dt(&peripheral_vcc_enable)) {
+		rc = gpio_pin_configure_dt(&peripheral_vcc_enable, GPIO_OUTPUT_INACTIVE);
+		if (rc == 0) {
+			rc = gpio_pin_set_dt(&peripheral_vcc_enable, 0);
+		}
+		if (rc != 0) {
+			return rc;
+		}
+	}
+#endif
+
+	return 0;
 }
