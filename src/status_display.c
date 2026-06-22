@@ -1,6 +1,7 @@
 #include "status_display.h"
 
 #include <errno.h>
+#include <stdio.h>
 
 #include <zephyr/device.h>
 #include <zephyr/display/cfb.h>
@@ -43,6 +44,14 @@ LOG_MODULE_REGISTER(status_display, LOG_LEVEL_INF);
 #define TINY_GLYPH_WIDTH 4U
 #define TINY_GLYPH_HEIGHT 5U
 #define TINY_GLYPH_GAP 1U
+#define MODE_LABEL_DONGLE_X 18U
+#define MODE_LABEL_BLE_X 2U
+#define MODE_LABEL_Y 1U
+#define MENU_TITLE_X 0U
+#define MENU_TITLE_Y 0U
+#define MENU_ITEM_X 0U
+#define MENU_FIRST_ITEM_Y 11U
+#define MENU_ITEM_LINE_HEIGHT 10U
 
 static const struct device *const display = DEVICE_DT_GET(DISPLAY_NODE);
 static uint16_t display_width_px = DISPLAY_DEFAULT_WIDTH;
@@ -76,6 +85,7 @@ static const uint8_t charge_bolt_rows[CHARGE_BOLT_HEIGHT] = {
 };
 
 static int draw_small_glyph(uint16_t x, uint16_t y, uint8_t width, const uint8_t *rows);
+static int draw_small_text(uint16_t x, uint16_t y, const char *text);
 
 static uint8_t battery_mv_to_pct(uint16_t mv)
 {
@@ -361,6 +371,26 @@ static int draw_usb_icon(void)
 	return draw_bitmap(x, TOP_ICON_Y, USB_ICON_WIDTH, USB_ICON_HEIGHT, rows);
 }
 
+static int draw_display_text(uint16_t x, uint16_t y, const char *text)
+{
+	int rc = cfb_print(display, text, x, y);
+
+	if (rc != 0) {
+		LOG_ERR("cfb_print failed: %d", rc);
+	}
+
+	return rc;
+}
+
+static int draw_mode_label(enum macropad_operating_mode mode)
+{
+	if (mode == MACROPAD_OPERATING_MODE_BLE) {
+		return draw_small_text(MODE_LABEL_BLE_X, MODE_LABEL_Y, "BLE");
+	}
+
+	return draw_small_text(MODE_LABEL_DONGLE_X, MODE_LABEL_Y, "DONGLE");
+}
+
 static void tiny_digit_rows(uint8_t digit, uint8_t rows[TINY_GLYPH_HEIGHT])
 {
 	switch (digit) {
@@ -450,12 +480,40 @@ static void tiny_percent_rows(uint8_t rows[TINY_GLYPH_HEIGHT])
 static void tiny_letter_rows(char ch, uint8_t rows[TINY_GLYPH_HEIGHT])
 {
 	switch (ch) {
+	case 'B':
+		rows[0] = 0x0EU;
+		rows[1] = 0x09U;
+		rows[2] = 0x0EU;
+		rows[3] = 0x09U;
+		rows[4] = 0x0EU;
+		break;
 	case 'C':
 		rows[0] = 0x06U;
 		rows[1] = 0x08U;
 		rows[2] = 0x08U;
 		rows[3] = 0x08U;
 		rows[4] = 0x06U;
+		break;
+	case 'D':
+		rows[0] = 0x0EU;
+		rows[1] = 0x09U;
+		rows[2] = 0x09U;
+		rows[3] = 0x09U;
+		rows[4] = 0x0EU;
+		break;
+	case 'E':
+		rows[0] = 0x0FU;
+		rows[1] = 0x08U;
+		rows[2] = 0x0EU;
+		rows[3] = 0x08U;
+		rows[4] = 0x0FU;
+		break;
+	case 'G':
+		rows[0] = 0x06U;
+		rows[1] = 0x08U;
+		rows[2] = 0x0BU;
+		rows[3] = 0x09U;
+		rows[4] = 0x07U;
 		break;
 	case 'H':
 		rows[0] = 0x09U;
@@ -464,13 +522,33 @@ static void tiny_letter_rows(char ch, uint8_t rows[TINY_GLYPH_HEIGHT])
 		rows[3] = 0x09U;
 		rows[4] = 0x09U;
 		break;
-	case 'G':
-	default:
-		rows[0] = 0x06U;
+	case 'L':
+		rows[0] = 0x08U;
 		rows[1] = 0x08U;
+		rows[2] = 0x08U;
+		rows[3] = 0x08U;
+		rows[4] = 0x0FU;
+		break;
+	case 'N':
+		rows[0] = 0x09U;
+		rows[1] = 0x0DU;
 		rows[2] = 0x0BU;
 		rows[3] = 0x09U;
-		rows[4] = 0x07U;
+		rows[4] = 0x09U;
+		break;
+	case 'O':
+		rows[0] = 0x06U;
+		rows[1] = 0x09U;
+		rows[2] = 0x09U;
+		rows[3] = 0x09U;
+		rows[4] = 0x06U;
+		break;
+	default:
+		rows[0] = 0x00U;
+		rows[1] = 0x00U;
+		rows[2] = 0x00U;
+		rows[3] = 0x00U;
+		rows[4] = 0x00U;
 		break;
 	}
 }
@@ -627,6 +705,11 @@ int status_display_init(void)
 		return rc;
 	}
 
+	rc = cfb_framebuffer_set_font(display, 0);
+	if (rc != 0) {
+		LOG_WRN("cfb_framebuffer_set_font failed: %d", rc);
+	}
+
 	value = cfb_get_display_parameter(display, CFB_DISPLAY_WIDTH);
 	if (value > 0) {
 		display_width_px = (uint16_t)value;
@@ -649,9 +732,17 @@ int status_display_render(const struct status_display_state *state)
 		return rc;
 	}
 
-	rc = draw_dongle_icon(state->connected, state->dongle_activity);
+	if (state->operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
+		rc = draw_dongle_icon(state->connected, state->dongle_activity);
+		if (rc != 0) {
+			LOG_ERR("draw dongle icon failed: %d", rc);
+			return rc;
+		}
+	}
+
+	rc = draw_mode_label(state->operating_mode);
 	if (rc != 0) {
-		LOG_ERR("draw dongle icon failed: %d", rc);
+		LOG_ERR("draw mode label failed: %d", rc);
 		return rc;
 	}
 
@@ -681,6 +772,47 @@ int status_display_render(const struct status_display_state *state)
 	if (rc != 0) {
 		LOG_ERR("draw battery meter failed: %d", rc);
 		return rc;
+	}
+
+	rc = cfb_framebuffer_finalize(display);
+	if (rc != 0) {
+		LOG_ERR("cfb_framebuffer_finalize failed: %d", rc);
+	}
+
+	return rc;
+}
+
+int status_display_render_menu(const char *title, const char *const *items,
+			       size_t item_count, size_t selected_index)
+{
+	int rc;
+
+	if ((title == NULL) || ((items == NULL) && (item_count != 0U)) ||
+	    ((item_count != 0U) && (selected_index >= item_count))) {
+		return -EINVAL;
+	}
+
+	rc = cfb_framebuffer_clear(display, false);
+	if (rc != 0) {
+		LOG_ERR("cfb_framebuffer_clear failed: %d", rc);
+		return rc;
+	}
+
+	rc = draw_display_text(MENU_TITLE_X, MENU_TITLE_Y, title);
+	if (rc != 0) {
+		return rc;
+	}
+
+	for (size_t index = 0U; index < item_count; ++index) {
+		char line[18];
+		uint16_t y = MENU_FIRST_ITEM_Y + (uint16_t)(index * MENU_ITEM_LINE_HEIGHT);
+
+		(void)snprintf(line, sizeof(line), "%c %s",
+			(index == selected_index) ? '>' : ' ', items[index]);
+		rc = draw_display_text(MENU_ITEM_X, y, line);
+		if (rc != 0) {
+			return rc;
+		}
 	}
 
 	rc = cfb_framebuffer_finalize(display);

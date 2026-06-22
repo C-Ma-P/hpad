@@ -31,6 +31,7 @@
 #define radio_esb_api_set_prefixes esb_set_prefixes
 #define radio_esb_api_set_rf_channel esb_set_rf_channel
 #define radio_esb_api_write_payload esb_write_payload
+#define radio_esb_api_disable esb_disable
 #elif __has_include(<nrf_esb.h>)
 #include <nrf_esb.h>
 
@@ -53,6 +54,7 @@
 #define radio_esb_api_set_prefixes nrf_esb_set_prefixes
 #define radio_esb_api_set_rf_channel nrf_esb_set_rf_channel
 #define radio_esb_api_write_payload nrf_esb_write_payload
+#define radio_esb_api_disable nrf_esb_disable
 #else
 #error "Unable to find an ESB header for this SDK"
 #endif
@@ -308,6 +310,21 @@ int radio_esb_start(void)
 	radio_esb_api_flush_tx();
 	radio_esb_api_flush_rx();
 	LOG_INF("ESB sender ready");
+	return 0;
+}
+
+int radio_esb_stop(void)
+{
+	if (!radio_initialized) {
+		return 0;
+	}
+
+	radio_esb_api_flush_tx();
+	radio_esb_api_flush_rx();
+	(void)radio_esb_clear_tracked_tx_queue();
+	radio_esb_api_disable();
+	radio_initialized = false;
+	LOG_INF("ESB stopped");
 	return 0;
 }
 

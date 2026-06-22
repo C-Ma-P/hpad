@@ -11,9 +11,12 @@ LOG_MODULE_REGISTER(macropad_config, LOG_LEVEL_INF);
 
 #define MACROPAD_CONFIG_SETTINGS_ROOT "macropad_cfg"
 #define MACROPAD_CONFIG_SETTINGS_KEY MACROPAD_CONFIG_SETTINGS_ROOT "/leds"
+#define MACROPAD_MODE_SETTINGS_KEY MACROPAD_CONFIG_SETTINGS_ROOT "/mode"
 
 static macropad_config_t stored_config;
 static bool stored_config_loaded;
+static enum macropad_operating_mode stored_operating_mode;
+static bool stored_operating_mode_loaded;
 
 static void macropad_config_default(macropad_config_t *config)
 {
@@ -29,11 +32,47 @@ static bool macropad_config_valid(const macropad_config_t *config)
 	return (config != NULL) && (config->kind == HPAD_PROTOCOL_CONFIG_KIND_KEY_COLORS);
 }
 
+static bool macropad_operating_mode_valid(uint8_t mode)
+{
+	return (mode == MACROPAD_OPERATING_MODE_DONGLE) ||
+		(mode == MACROPAD_OPERATING_MODE_BLE);
+}
+
 static int macropad_config_settings_set(const char *name, size_t len_rd,
 				settings_read_cb read_cb, void *cb_arg)
 {
 	macropad_config_t loaded_config;
 	int rc;
+
+	if (settings_name_steq(name, "mode", NULL)) {
+		uint8_t loaded_mode;
+
+		if (len_rd != sizeof(loaded_mode)) {
+			LOG_WRN("Stored macropad mode length %zu does not match expected %zu",
+				len_rd, sizeof(loaded_mode));
+			stored_operating_mode_loaded = false;
+			return 0;
+		}
+
+		rc = read_cb(cb_arg, &loaded_mode, sizeof(loaded_mode));
+		if (rc < 0) {
+			return rc;
+		}
+		if (rc != sizeof(loaded_mode)) {
+			LOG_WRN("Settings read returned %d bytes for macropad mode", rc);
+			stored_operating_mode_loaded = false;
+			return 0;
+		}
+		if (!macropad_operating_mode_valid(loaded_mode)) {
+			LOG_WRN("Ignoring invalid persisted macropad mode %u", loaded_mode);
+			stored_operating_mode_loaded = false;
+			return 0;
+		}
+
+		stored_operating_mode = (enum macropad_operating_mode)loaded_mode;
+		stored_operating_mode_loaded = true;
+		return 0;
+	}
 
 	if (!settings_name_steq(name, "leds", NULL)) {
 		return -ENOENT;
@@ -75,16 +114,18 @@ int macropad_config_init(void)
 
 	macropad_config_default(&stored_config);
 	stored_config_loaded = false;
+	stored_operating_mode = MACROPAD_OPERATING_MODE_DONGLE;
+	stored_operating_mode_loaded = false;
 
 	rc = settings_subsys_init();
 	if ((rc != 0) && (rc != -EALREADY)) {
-		LOG_WRN("settings_subsys_init failed: %d, continuing with default LED config", rc);
+		LOG_WRN("settings_subsys_init failed: %d, continuing with default config", rc);
 		return 0;
 	}
 
 	rc = settings_load_subtree(MACROPAD_CONFIG_SETTINGS_ROOT);
 	if (rc != 0) {
-		LOG_WRN("settings_load_subtree failed: %d, using default LED config", rc);
+		LOG_WRN("settings_load_subtree failed: %d, using default config", rc);
 		return 0;
 	}
 
@@ -92,6 +133,11 @@ int macropad_config_init(void)
 		LOG_INF("Loaded persisted macropad LED config");
 	} else {
 		LOG_INF("No persisted macropad LED config found");
+	}
+	if (stored_operating_mode_loaded) {
+		LOG_INF("Loaded persisted macropad mode %u", stored_operating_mode);
+	} else {
+		LOG_INF("No persisted macropad mode found, defaulting to dongle");
 	}
 
 	return 0;
@@ -126,5 +172,35 @@ int macropad_config_store(const macropad_config_t *config)
 	}
 
 	LOG_INF("Stored macropad LED config");
+	return 0;
+}
+
+enum macropad_operating_mode macropad_config_get_operating_mode(void)
+{
+	return stored_operating_mode;
+}
+
+int macropad_config_store_operating_mode(enum macropad_operating_mode mode)
+{
+	uint8_t stored_mode = (uint8_t)mode;
+	int rc;
+
+	if (!macropad_operating_mode_valid(stored_mode)) {
+		return -EINVAL;
+	}
+
+	if (stored_operating_mode_loaded && (stored_operating_mode == mode)) {
+		return 0;
+	}
+
+	stored_operating_mode = mode;
+	stored_operating_mode_loaded = true;
+	rc = settings_save_one(MACROPAD_MODE_SETTINGS_KEY, &stored_mode, sizeof(stored_mode));
+	if (rc != 0) {
+		LOG_WRN("settings_save_one failed: %d, keeping mode in memory", rc);
+		return rc;
+	}
+
+	LOG_INF("Stored macropad mode %u", stored_mode);
 	return 0;
 }

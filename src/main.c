@@ -8,13 +8,20 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/poweroff.h>
 
+#if defined(CONFIG_MPSL_DYNAMIC_INTERRUPTS)
+#include <mpsl.h>
+#include <mpsl/mpsl_lib.h>
+#endif
+
 #include "battery.h"
+#include "ble_hid.h"
 #include "bringup.h"
 #include "encoder.h"
 #include "key_leds.h"
@@ -38,6 +45,8 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define BATTERY_POWEROFF_CLEAR_MV 3350U
 #define BATTERY_POWEROFF_SUSTAIN_MS 60000
 #define BATTERY_CRITICAL_BLINK_MS 500
+#define ENCODER_LONG_PRESS_MS 700
+#define OPTIONS_MENU_ITEM_COUNT 2U
 
 static struct k_spinlock input_state_lock;
 
@@ -60,11 +69,26 @@ struct app_event {
 };
 
 struct app_ui_state {
+	enum macropad_operating_mode operating_mode;
 	bool connected;
 	bool dongle_activity;
 	bool usb_power_present;
 	bool battery_warning_visible;
 	int64_t last_delivery_success_ms;
+};
+
+enum options_menu_action {
+	OPTIONS_MENU_ACTION_SWITCH_MODE = 0,
+	OPTIONS_MENU_ACTION_CLOSE = 1,
+};
+
+struct options_menu_item {
+	enum options_menu_action action;
+};
+
+struct options_menu_state {
+	bool open;
+	size_t selected_index;
 };
 
 struct battery_policy_state {
@@ -89,6 +113,14 @@ static struct battery_policy_state battery_policy_state = {
 };
 static int32_t pending_encoder_delta;
 static bool encoder_delta_event_pending;
+
+static const struct options_menu_item options_menu_items[OPTIONS_MENU_ITEM_COUNT] = {
+	{ .action = OPTIONS_MENU_ACTION_SWITCH_MODE },
+	{ .action = OPTIONS_MENU_ACTION_CLOSE },
+};
+
+static void handle_radio_delivery(enum radio_esb_tx_kind kind, bool acked);
+static void handle_radio_config(const macropad_config_t *config);
 
 static int app_queue_event(const struct app_event *event)
 {
@@ -190,6 +222,164 @@ static uint16_t battery_display_mv(void)
 	return macropad_input_state.battery_mv;
 }
 
+static enum macropad_operating_mode opposite_mode(enum macropad_operating_mode mode)
+{
+	return (mode == MACROPAD_OPERATING_MODE_BLE) ?
+		MACROPAD_OPERATING_MODE_DONGLE : MACROPAD_OPERATING_MODE_BLE;
+}
+
+static const char *mode_menu_label(enum macropad_operating_mode current_mode)
+{
+	return (current_mode == MACROPAD_OPERATING_MODE_BLE) ?
+		"Dongle Mode" : "BLE Mode";
+}
+
+static void options_menu_labels(enum macropad_operating_mode current_mode,
+				const char *labels[OPTIONS_MENU_ITEM_COUNT])
+{
+	labels[0] = mode_menu_label(current_mode);
+	labels[1] = "Close";
+}
+
+static void options_menu_open(struct options_menu_state *menu)
+{
+	menu->open = true;
+	menu->selected_index = 0U;
+}
+
+static void options_menu_close(struct options_menu_state *menu)
+{
+	menu->open = false;
+	menu->selected_index = 0U;
+}
+
+static void options_menu_move(struct options_menu_state *menu, int32_t delta)
+{
+	if (!menu->open || (delta == 0)) {
+		return;
+	}
+
+	while (delta > 0) {
+		menu->selected_index = (menu->selected_index + 1U) %
+			ARRAY_SIZE(options_menu_items);
+		delta--;
+	}
+	while (delta < 0) {
+		menu->selected_index = (menu->selected_index == 0U) ?
+			(ARRAY_SIZE(options_menu_items) - 1U) : (menu->selected_index - 1U);
+		delta++;
+	}
+}
+
+static int start_dongle_transport(void)
+{
+	struct dongle_identity identity;
+	struct esb_addr_config addr_config;
+	uint8_t rf_channel;
+	bool generated;
+	int rc;
+
+#if defined(CONFIG_MPSL_DYNAMIC_INTERRUPTS)
+	if (mpsl_is_initialized()) {
+		int32_t mpsl_rc = mpsl_lib_uninit();
+
+		if (mpsl_rc != 0) {
+			LOG_ERR("mpsl_lib_uninit failed before ESB start: %d", (int)mpsl_rc);
+			return -EIO;
+		}
+	}
+#endif
+
+	rc = radio_identity_init();
+	if (rc != 0) {
+		LOG_ERR("radio_identity_init failed: %d", rc);
+		return rc;
+	}
+
+	rc = radio_identity_load_or_create(&identity, &generated);
+	if (rc != 0) {
+		LOG_ERR("radio_identity_load_or_create failed: %d", rc);
+		return rc;
+	}
+
+	LOG_INF("Macropad identity synchronized");
+	rc = radio_identity_derive_esb_config(&identity, &addr_config, &rf_channel);
+	if (rc != 0) {
+		LOG_ERR("radio_identity_derive_esb_config failed: %d", rc);
+		return rc;
+	}
+
+	radio_identity_log_esb_config(&addr_config, rf_channel);
+	rc = radio_esb_init(&addr_config, rf_channel, handle_radio_delivery, handle_radio_config);
+	if (rc != 0) {
+		LOG_ERR("radio_esb_init failed: %d", rc);
+		return rc;
+	}
+
+	rc = radio_esb_start();
+	if (rc != 0) {
+		LOG_ERR("radio_esb_start failed: %d", rc);
+		(void)radio_esb_stop();
+		return rc;
+	}
+
+	return 0;
+}
+
+static int start_transport(enum macropad_operating_mode mode)
+{
+	if (mode == MACROPAD_OPERATING_MODE_BLE) {
+		return ble_hid_start();
+	}
+
+	return start_dongle_transport();
+}
+
+static int stop_transport(enum macropad_operating_mode mode)
+{
+	if (mode == MACROPAD_OPERATING_MODE_BLE) {
+		(void)ble_hid_send_key_state(0U);
+		return ble_hid_stop();
+	}
+
+	return radio_esb_stop();
+}
+
+static int switch_operating_mode(struct app_ui_state *ui_state,
+				 enum macropad_operating_mode target_mode)
+{
+	enum macropad_operating_mode previous_mode;
+	int rc;
+
+	if (ui_state->operating_mode == target_mode) {
+		return 0;
+	}
+
+	previous_mode = ui_state->operating_mode;
+	rc = stop_transport(previous_mode);
+	if (rc != 0) {
+		LOG_WRN("Failed to stop mode %u cleanly: %d", previous_mode, rc);
+	}
+
+	rc = start_transport(target_mode);
+	if (rc != 0) {
+		LOG_ERR("Failed to start mode %u: %d", target_mode, rc);
+		(void)start_transport(previous_mode);
+		return rc;
+	}
+
+	rc = macropad_config_store_operating_mode(target_mode);
+	if (rc != 0) {
+		LOG_WRN("Failed to persist mode %u: %d", target_mode, rc);
+	}
+
+	ui_state->operating_mode = target_mode;
+	ui_state->connected = false;
+	ui_state->dongle_activity = false;
+	ui_state->last_delivery_success_ms = INT64_MIN;
+	return 0;
+}
+
 static int save_runtime_state(void)
 {
 	return 0;
@@ -250,6 +440,7 @@ static void enforce_battery_policy(bool usb_power_present,
 static struct status_display_state make_display_state(const struct app_ui_state *ui_state)
 {
 	return (struct status_display_state){
+		.operating_mode = ui_state->operating_mode,
 		.connected = ui_state->connected,
 		.dongle_activity = ui_state->dongle_activity,
 		.usb_power_present = ui_state->usb_power_present,
@@ -315,6 +506,21 @@ static int send_encoder_delta_reports(int32_t total_delta)
 
 	macropad_input_state.encoder_delta = 0;
 	return rc;
+}
+
+static int send_encoder_button_click_report(void)
+{
+	int rc;
+
+	macropad_input_state.encoder_pressed = 1U;
+	rc = macropad_send_report();
+	if (rc != 0) {
+		macropad_input_state.encoder_pressed = 0U;
+		return rc;
+	}
+
+	macropad_input_state.encoder_pressed = 0U;
+	return macropad_send_report();
 }
 
 static void handle_encoder_delta(int8_t delta)
@@ -404,6 +610,7 @@ static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 	bool usb_power_present = status_usb_power_present();
 	bool dongle_activity;
 	bool warning_visible;
+	bool connected;
 
 	if (state->usb_power_present != usb_power_present) {
 		state->usb_power_present = usb_power_present;
@@ -414,19 +621,31 @@ static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 		dirty = true;
 	}
 
-	if (state->connected &&
-	    (state->last_delivery_success_ms != INT64_MIN) &&
-	    ((now_ms - state->last_delivery_success_ms) >= CONNECTION_TIMEOUT_MS)) {
-		state->connected = false;
-		dirty = true;
-	}
+	if (state->operating_mode == MACROPAD_OPERATING_MODE_BLE) {
+		connected = ble_hid_is_connected();
+		if (state->connected != connected) {
+			state->connected = connected;
+			dirty = true;
+		}
+		if (state->dongle_activity) {
+			state->dongle_activity = false;
+			dirty = true;
+		}
+	} else {
+		if (state->connected &&
+		    (state->last_delivery_success_ms != INT64_MIN) &&
+		    ((now_ms - state->last_delivery_success_ms) >= CONNECTION_TIMEOUT_MS)) {
+			state->connected = false;
+			dirty = true;
+		}
 
-	dongle_activity = state->connected &&
-		(state->last_delivery_success_ms != INT64_MIN) &&
-		((now_ms - state->last_delivery_success_ms) < DONGLE_ACTIVITY_PULSE_MS);
-	if (state->dongle_activity != dongle_activity) {
-		state->dongle_activity = dongle_activity;
-		dirty = true;
+		dongle_activity = state->connected &&
+			(state->last_delivery_success_ms != INT64_MIN) &&
+			((now_ms - state->last_delivery_success_ms) < DONGLE_ACTIVITY_PULSE_MS);
+		if (state->dongle_activity != dongle_activity) {
+			state->dongle_activity = dongle_activity;
+			dirty = true;
+		}
 	}
 
 	warning_visible = battery_warning_visible(usb_power_present, now_ms);
@@ -535,25 +754,29 @@ int main(void)
 
 	//return macropad_keys_led_smoke_test();
 
-	struct dongle_identity identity;
-	struct esb_addr_config addr_config;
 	struct app_event event;
 	struct app_ui_state ui_state = {
+		.operating_mode = MACROPAD_OPERATING_MODE_DONGLE,
 		.connected = false,
 		.dongle_activity = false,
 		.usb_power_present = false,
 		.battery_warning_visible = false,
 		.last_delivery_success_ms = INT64_MIN,
 	};
+	struct options_menu_state options_menu = {
+		.open = false,
+		.selected_index = 0U,
+	};
 	int64_t next_heartbeat_ms = 0;
 	int64_t last_display_update_ms = INT64_MIN;
 	int64_t last_activity_ms = 0;
-	uint8_t rf_channel;
-	bool generated;
+	int64_t encoder_button_down_ms = INT64_MIN;
 	bool display_available = false;
 	bool display_sleeping = false;
 	bool battery_warning_logged = false;
 	bool redraw = true;
+	bool encoder_button_down = false;
+	bool encoder_long_press_consumed = false;
 	int rc;
 
 	rc = status_led_init();
@@ -572,6 +795,7 @@ int main(void)
 	if (rc != 0) {
 		LOG_INF("Macropad LED config unavailable (rc=%d)", rc);
 	}
+	ui_state.operating_mode = macropad_config_get_operating_mode();
 
 	rc = key_leds_init();
 	if (rc != 0) {
@@ -606,32 +830,6 @@ int main(void)
 		}
 	}
 
-	rc = radio_identity_init();
-	if (rc != 0) {
-		LOG_ERR("radio_identity_init failed: %d", rc);
-		return 0;
-	}
-
-	rc = radio_identity_load_or_create(&identity, &generated);
-	if (rc != 0) {
-		LOG_ERR("radio_identity_load_or_create failed: %d", rc);
-		return 0;
-	}
-
-	LOG_INF("Macropad identity synchronized");
-	rc = radio_identity_derive_esb_config(&identity, &addr_config, &rf_channel);
-	if (rc != 0) {
-		LOG_ERR("radio_identity_derive_esb_config failed: %d", rc);
-		return 0;
-	}
-
-	radio_identity_log_esb_config(&addr_config, rf_channel);
-	rc = radio_esb_init(&addr_config, rf_channel, handle_radio_delivery, handle_radio_config);
-	if (rc != 0) {
-		LOG_ERR("radio_esb_init failed: %d", rc);
-		return 0;
-	}
-
 	rc = encoder_init(handle_encoder_delta, handle_encoder_button);
 	if ((rc != 0) && (rc != -ENOTSUP)) {
 		LOG_ERR("encoder_init failed: %d", rc);
@@ -656,13 +854,13 @@ int main(void)
 		}
 	}
 
-	rc = radio_esb_start();
+	rc = start_transport(ui_state.operating_mode);
 	if (rc != 0) {
-		LOG_ERR("radio_esb_start failed: %d", rc);
+		LOG_ERR("Failed to start saved mode %u: %d", ui_state.operating_mode, rc);
 		return 0;
 	}
 
-	LOG_INF("Macropad sender ready");
+	LOG_INF("Macropad sender ready in mode %u", ui_state.operating_mode);
 	next_heartbeat_ms = k_uptime_get();
 	last_activity_ms = k_uptime_get();
 
@@ -685,10 +883,24 @@ int main(void)
 			}
 		}
 
+		if (encoder_button_down && !encoder_long_press_consumed &&
+		    ((now_ms - encoder_button_down_ms) >= ENCODER_LONG_PRESS_MS)) {
+			if (options_menu.open) {
+				options_menu_close(&options_menu);
+			} else {
+				options_menu_open(&options_menu);
+			}
+			encoder_long_press_consumed = true;
+			status_buzzer_set(false);
+			redraw = true;
+		}
+
 		if (now_ms >= next_heartbeat_ms) {
-			rc = macropad_send_heartbeat();
-			if (rc != 0) {
-				LOG_WRN("macropad_send_heartbeat failed: %d", rc);
+			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
+				rc = macropad_send_heartbeat();
+				if (rc != 0) {
+					LOG_WRN("macropad_send_heartbeat failed: %d", rc);
+				}
 			}
 
 			enforce_battery_policy(ui_state.usb_power_present, display_available,
@@ -700,9 +912,18 @@ int main(void)
 
 		if (display_available && !display_sleeping && redraw && ((last_display_update_ms == INT64_MIN) ||
 			      ((now_ms - last_display_update_ms) >= STATUS_DISPLAY_REFRESH_INTERVAL_MS))) {
-			const struct status_display_state display_state = make_display_state(&ui_state);
+			if (options_menu.open) {
+				const char *menu_labels[OPTIONS_MENU_ITEM_COUNT];
 
-			rc = status_display_render(&display_state);
+				options_menu_labels(ui_state.operating_mode, menu_labels);
+				rc = status_display_render_menu("Options", menu_labels,
+					ARRAY_SIZE(menu_labels), options_menu.selected_index);
+			} else {
+				const struct status_display_state display_state =
+					make_display_state(&ui_state);
+
+				rc = status_display_render(&display_state);
+			}
 			if (rc != 0) {
 				LOG_WRN("Display update failed (rc=%d), disabling OLED", rc);
 				display_available = false;
@@ -739,6 +960,18 @@ int main(void)
 			}
 		}
 
+		if (encoder_button_down && !encoder_long_press_consumed) {
+			int64_t long_press_wait_ms =
+				(encoder_button_down_ms + ENCODER_LONG_PRESS_MS) - now_ms;
+
+			if (long_press_wait_ms < 0) {
+				long_press_wait_ms = 0;
+			}
+			if (long_press_wait_ms < wait_ms) {
+				wait_ms = long_press_wait_ms;
+			}
+		}
+
 		if (display_available && !display_sleeping && !ui_state.usb_power_present) {
 			int64_t sleep_wait_ms = (last_activity_ms + DISPLAY_SLEEP_TIMEOUT_MS) - now_ms;
 
@@ -750,7 +983,8 @@ int main(void)
 			}
 		}
 
-		if (ui_state.connected && (ui_state.last_delivery_success_ms != INT64_MIN)) {
+		if ((ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) &&
+		    ui_state.connected && (ui_state.last_delivery_success_ms != INT64_MIN)) {
 			int64_t disconnect_wait_ms =
 				(ui_state.last_delivery_success_ms + CONNECTION_TIMEOUT_MS) - now_ms;
 			if (disconnect_wait_ms < wait_ms) {
@@ -814,25 +1048,68 @@ int main(void)
 				continue;
 			}
 
-			status_led_pulse(INPUT_ACTIVITY_LED_PULSE_MS);
-			redraw = true;
-
-			rc = send_encoder_delta_reports(encoder_delta);
-			if (rc != 0) {
-				LOG_ERR("send_encoder_delta_reports failed: %d", rc);
-			}
-		} else if (event.type == APP_EVENT_ENCODER_BUTTON) {
-			macropad_input_state.encoder_pressed = event.pressed;
-			status_buzzer_set(event.pressed != 0U);
-			rc = macropad_send_report();
-			if (rc != 0) {
-				LOG_ERR("macropad_send_report failed: %d", rc);
-			}
-
-			if (event.pressed == 0U) {
+			if (options_menu.open) {
+				options_menu_move(&options_menu, encoder_delta);
+				redraw = true;
 				continue;
 			}
 
+			status_led_pulse(INPUT_ACTIVITY_LED_PULSE_MS);
+			redraw = true;
+
+			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
+				rc = send_encoder_delta_reports(encoder_delta);
+				if (rc != 0) {
+					LOG_ERR("send_encoder_delta_reports failed: %d", rc);
+				}
+			}
+		} else if (event.type == APP_EVENT_ENCODER_BUTTON) {
+			if (event.pressed != 0U) {
+				encoder_button_down = true;
+				encoder_button_down_ms = now_ms;
+				encoder_long_press_consumed = false;
+				status_buzzer_set(true);
+				continue;
+			}
+
+			status_buzzer_set(false);
+			if (!encoder_button_down) {
+				continue;
+			}
+
+			encoder_button_down = false;
+			encoder_button_down_ms = INT64_MIN;
+			if (encoder_long_press_consumed) {
+				encoder_long_press_consumed = false;
+				continue;
+			}
+
+			if (options_menu.open) {
+				const struct options_menu_item *selected =
+					&options_menu_items[options_menu.selected_index];
+
+				if (selected->action == OPTIONS_MENU_ACTION_SWITCH_MODE) {
+					enum macropad_operating_mode target_mode =
+						opposite_mode(ui_state.operating_mode);
+
+					options_menu_close(&options_menu);
+					rc = switch_operating_mode(&ui_state, target_mode);
+					if (rc != 0) {
+						LOG_ERR("switch_operating_mode failed: %d", rc);
+					}
+				} else {
+					options_menu_close(&options_menu);
+				}
+				redraw = true;
+				continue;
+			}
+
+			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
+				rc = send_encoder_button_click_report();
+				if (rc != 0) {
+					LOG_ERR("send_encoder_button_click_report failed: %d", rc);
+				}
+			}
 			redraw = true;
 		} else if (event.type == APP_EVENT_MACROPAD_KEYS) {
 			macropad_input_state.keys = event.keys;
@@ -840,9 +1117,16 @@ int main(void)
 			if (rc != 0) {
 				LOG_WRN("Failed to update macropad LEDs: %d", rc);
 			}
-			rc = macropad_send_report();
-			if (rc != 0) {
-				LOG_ERR("macropad_send_report failed: %d", rc);
+			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_BLE) {
+				rc = ble_hid_send_key_state(macropad_input_state.keys);
+				if ((rc != 0) && (rc != -ENOTCONN) && (rc != -EAGAIN)) {
+					LOG_ERR("ble_hid_send_key_state failed: %d", rc);
+				}
+			} else {
+				rc = macropad_send_report();
+				if (rc != 0) {
+					LOG_ERR("macropad_send_report failed: %d", rc);
+				}
 			}
 
 			if (event.pressed == 0U) {

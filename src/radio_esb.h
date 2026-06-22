@@ -18,6 +18,7 @@ int radio_esb_init(const struct esb_addr_config *addr_config, uint8_t rf_channel
 		   radio_esb_delivery_handler_t delivery_handler,
 		   radio_esb_config_handler_t config_handler);
 int radio_esb_start(void);
+int radio_esb_stop(void);
 int radio_esb_send_heartbeat(const macropad_report_t *report);
 int radio_esb_send_macropad_report(const macropad_report_t *report);
 
