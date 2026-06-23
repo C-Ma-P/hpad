@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
@@ -33,6 +34,10 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
+#ifndef HPAD_FIRMWARE_VERSION
+#define HPAD_FIRMWARE_VERSION "unknown"
+#endif
+
 #define HEARTBEAT_INTERVAL_MS 1000
 #define CONNECTION_TIMEOUT_MS 2500
 #define INPUT_ACTIVITY_LED_PULSE_MS 80
@@ -46,7 +51,9 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define BATTERY_POWEROFF_SUSTAIN_MS 60000
 #define BATTERY_CRITICAL_BLINK_MS 500
 #define ENCODER_LONG_PRESS_MS 700
-#define OPTIONS_MENU_ITEM_COUNT 3U
+#define OPTIONS_MENU_MAX_ITEM_COUNT 4U
+#define DEVICE_INFO_LINE_COUNT 5U
+#define DEVICE_INFO_LINE_MAX_LEN 64U
 #define TRANSIENT_MESSAGE_HOLD_MS 700
 
 static struct k_spinlock input_state_lock;
@@ -82,7 +89,8 @@ struct app_ui_state {
 enum options_menu_action {
 	OPTIONS_MENU_ACTION_SWITCH_MODE = 0,
 	OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING = 1,
-	OPTIONS_MENU_ACTION_CLOSE = 2,
+	OPTIONS_MENU_ACTION_DEVICE_INFO = 2,
+	OPTIONS_MENU_ACTION_CLOSE = 3,
 };
 
 struct options_menu_item {
@@ -93,6 +101,16 @@ struct options_menu_state {
 	bool open;
 	size_t selected_index;
 	size_t first_visible_index;
+};
+
+struct device_info_state {
+	bool open;
+	size_t first_visible_index;
+};
+
+struct device_info_lines {
+	char storage[DEVICE_INFO_LINE_COUNT][DEVICE_INFO_LINE_MAX_LEN];
+	const char *lines[DEVICE_INFO_LINE_COUNT];
 };
 
 struct battery_policy_state {
@@ -118,9 +136,16 @@ static struct battery_policy_state battery_policy_state = {
 static int32_t pending_encoder_delta;
 static bool encoder_delta_event_pending;
 
-static const struct options_menu_item options_menu_items[OPTIONS_MENU_ITEM_COUNT] = {
+static const struct options_menu_item options_menu_dongle_items[] = {
+	{ .action = OPTIONS_MENU_ACTION_SWITCH_MODE },
+	{ .action = OPTIONS_MENU_ACTION_DEVICE_INFO },
+	{ .action = OPTIONS_MENU_ACTION_CLOSE },
+};
+
+static const struct options_menu_item options_menu_ble_items[] = {
 	{ .action = OPTIONS_MENU_ACTION_SWITCH_MODE },
 	{ .action = OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING },
+	{ .action = OPTIONS_MENU_ACTION_DEVICE_INFO },
 	{ .action = OPTIONS_MENU_ACTION_CLOSE },
 };
 
@@ -227,6 +252,73 @@ static uint16_t battery_display_mv(void)
 	return macropad_input_state.battery_mv;
 }
 
+static uint8_t battery_percent_from_mv(uint16_t mv)
+{
+	if (mv >= 4200U) {
+		return 100U;
+	}
+	if (mv <= 3000U) {
+		return 0U;
+	}
+
+	return (uint8_t)((uint32_t)(mv - 3000U) * 100U / 1200U);
+}
+
+static const char *ble_info_link_label(enum ble_hid_state state)
+{
+	switch (state) {
+	case BLE_HID_STATE_INACTIVE:
+		return "Off";
+	case BLE_HID_STATE_STARTING:
+		return "Starting";
+	case BLE_HID_STATE_ADVERTISING:
+		return "Ready";
+	case BLE_HID_STATE_CONNECTED:
+		return "Connected";
+	case BLE_HID_STATE_SECURITY_FAILED:
+		return "Pair Error";
+	case BLE_HID_STATE_STOPPING:
+		return "Stopping";
+	case BLE_HID_STATE_ERROR:
+	default:
+		return "Error";
+	}
+}
+
+static const char *mode_info_label(enum macropad_operating_mode mode)
+{
+	return (mode == MACROPAD_OPERATING_MODE_BLE) ? "BLE" : "Dongle";
+}
+
+static void build_device_info_lines(const struct app_ui_state *ui_state,
+				    struct device_info_lines *info)
+{
+	const uint16_t battery_mv = battery_display_mv();
+	const uint8_t battery_pct = battery_percent_from_mv(battery_mv);
+	const char *link_label;
+
+	for (size_t index = 0U; index < DEVICE_INFO_LINE_COUNT; ++index) {
+		info->lines[index] = info->storage[index];
+	}
+
+	if (ui_state->operating_mode == MACROPAD_OPERATING_MODE_BLE) {
+		link_label = ble_info_link_label(ble_hid_get_state());
+	} else {
+		link_label = ui_state->connected ? "Connected" : "Waiting";
+	}
+
+	(void)snprintf(info->storage[0], sizeof(info->storage[0]), "FW: %s",
+		HPAD_FIRMWARE_VERSION);
+	(void)snprintf(info->storage[1], sizeof(info->storage[1]), "Mode: %s",
+		mode_info_label(ui_state->operating_mode));
+	(void)snprintf(info->storage[2], sizeof(info->storage[2]), "Link: %s",
+		link_label);
+	(void)snprintf(info->storage[3], sizeof(info->storage[3]), "Batt: %u.%02uV %u%%",
+		battery_mv / 1000U, (battery_mv % 1000U) / 10U, battery_pct);
+	(void)snprintf(info->storage[4], sizeof(info->storage[4]), "USB: %s",
+		ui_state->usb_power_present ? "Yes" : "No");
+}
+
 static enum macropad_operating_mode opposite_mode(enum macropad_operating_mode mode)
 {
 	return (mode == MACROPAD_OPERATING_MODE_BLE) ?
@@ -239,19 +331,79 @@ static const char *mode_menu_label(enum macropad_operating_mode current_mode)
 		"Dongle Mode" : "BLE Mode";
 }
 
-static void options_menu_labels(enum macropad_operating_mode current_mode,
-				const char *labels[OPTIONS_MENU_ITEM_COUNT])
+static const struct options_menu_item *
+options_menu_items_for_mode(enum macropad_operating_mode current_mode,
+			    size_t *item_count)
 {
-	labels[0] = mode_menu_label(current_mode);
-	labels[1] = "Forget Pairing";
-	labels[2] = "Close";
+	if (current_mode == MACROPAD_OPERATING_MODE_BLE) {
+		*item_count = ARRAY_SIZE(options_menu_ble_items);
+		return options_menu_ble_items;
+	}
+
+	*item_count = ARRAY_SIZE(options_menu_dongle_items);
+	return options_menu_dongle_items;
 }
 
-static void options_menu_open(struct options_menu_state *menu)
+static const char *options_menu_action_label(enum options_menu_action action,
+					     enum macropad_operating_mode current_mode)
+{
+	switch (action) {
+	case OPTIONS_MENU_ACTION_SWITCH_MODE:
+		return mode_menu_label(current_mode);
+	case OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING:
+		return "Forget Pairing";
+	case OPTIONS_MENU_ACTION_DEVICE_INFO:
+		return "Device Info";
+	case OPTIONS_MENU_ACTION_CLOSE:
+	default:
+		return "Close";
+	}
+}
+
+static size_t options_menu_labels(enum macropad_operating_mode current_mode,
+				  const char *labels[OPTIONS_MENU_MAX_ITEM_COUNT])
+{
+	const struct options_menu_item *items;
+	size_t item_count;
+
+	items = options_menu_items_for_mode(current_mode, &item_count);
+	for (size_t index = 0U; index < item_count; ++index) {
+		labels[index] = options_menu_action_label(items[index].action, current_mode);
+	}
+
+	return item_count;
+}
+
+static void options_menu_clamp(struct options_menu_state *menu,
+			       enum macropad_operating_mode current_mode)
+{
+	size_t item_count;
+
+	if (menu == NULL) {
+		return;
+	}
+
+	(void)options_menu_items_for_mode(current_mode, &item_count);
+	if (item_count == 0U) {
+		menu->selected_index = 0U;
+		menu->first_visible_index = 0U;
+		return;
+	}
+
+	if (menu->selected_index >= item_count) {
+		menu->selected_index = item_count - 1U;
+	}
+	status_display_menu_clamp_viewport(item_count, menu->selected_index,
+		&menu->first_visible_index);
+}
+
+static void options_menu_open(struct options_menu_state *menu,
+			      enum macropad_operating_mode current_mode)
 {
 	menu->open = true;
 	menu->selected_index = 0U;
 	menu->first_visible_index = 0U;
+	options_menu_clamp(menu, current_mode);
 }
 
 static void options_menu_close(struct options_menu_state *menu)
@@ -261,24 +413,71 @@ static void options_menu_close(struct options_menu_state *menu)
 	menu->first_visible_index = 0U;
 }
 
-static void options_menu_move(struct options_menu_state *menu, int32_t delta)
+static void options_menu_move(struct options_menu_state *menu,
+			      enum macropad_operating_mode current_mode,
+			      int32_t delta)
 {
+	size_t item_count;
+
 	if (!menu->open || (delta == 0)) {
 		return;
 	}
 
+	(void)options_menu_items_for_mode(current_mode, &item_count);
+	if (item_count == 0U) {
+		return;
+	}
+	options_menu_clamp(menu, current_mode);
+
 	while (delta > 0) {
-		menu->selected_index = (menu->selected_index + 1U) %
-			ARRAY_SIZE(options_menu_items);
-		status_display_menu_clamp_viewport(ARRAY_SIZE(options_menu_items),
+		menu->selected_index = (menu->selected_index + 1U) % item_count;
+		status_display_menu_clamp_viewport(item_count,
 			menu->selected_index, &menu->first_visible_index);
 		delta--;
 	}
 	while (delta < 0) {
 		menu->selected_index = (menu->selected_index == 0U) ?
-			(ARRAY_SIZE(options_menu_items) - 1U) : (menu->selected_index - 1U);
-		status_display_menu_clamp_viewport(ARRAY_SIZE(options_menu_items),
+			(item_count - 1U) : (menu->selected_index - 1U);
+		status_display_menu_clamp_viewport(item_count,
 			menu->selected_index, &menu->first_visible_index);
+		delta++;
+	}
+}
+
+static void device_info_open(struct device_info_state *info)
+{
+	info->open = true;
+	info->first_visible_index = 0U;
+}
+
+static void device_info_close(struct device_info_state *info)
+{
+	info->open = false;
+	info->first_visible_index = 0U;
+}
+
+static void device_info_move(struct device_info_state *info, int32_t delta)
+{
+	size_t visible_rows;
+	size_t max_first;
+
+	if (!info->open || (delta == 0)) {
+		return;
+	}
+
+	visible_rows = status_display_menu_visible_rows();
+	if (visible_rows >= DEVICE_INFO_LINE_COUNT) {
+		info->first_visible_index = 0U;
+		return;
+	}
+
+	max_first = DEVICE_INFO_LINE_COUNT - visible_rows;
+	while ((delta > 0) && (info->first_visible_index < max_first)) {
+		info->first_visible_index++;
+		delta--;
+	}
+	while ((delta < 0) && (info->first_visible_index > 0U)) {
+		info->first_visible_index--;
 		delta++;
 	}
 }
@@ -863,6 +1062,10 @@ int main(void)
 		.selected_index = 0U,
 		.first_visible_index = 0U,
 	};
+	struct device_info_state device_info = {
+		.open = false,
+		.first_visible_index = 0U,
+	};
 	int64_t next_heartbeat_ms = 0;
 	int64_t last_display_update_ms = INT64_MIN;
 	int64_t last_activity_ms = 0;
@@ -982,10 +1185,13 @@ int main(void)
 
 		if (encoder_button_down && !encoder_long_press_consumed &&
 		    ((now_ms - encoder_button_down_ms) >= ENCODER_LONG_PRESS_MS)) {
-			if (options_menu.open) {
+			if (device_info.open) {
+				device_info_close(&device_info);
+				options_menu_close(&options_menu);
+			} else if (options_menu.open) {
 				options_menu_close(&options_menu);
 			} else {
-				options_menu_open(&options_menu);
+				options_menu_open(&options_menu, ui_state.operating_mode);
 			}
 			encoder_long_press_consumed = true;
 			status_buzzer_set(false);
@@ -1009,12 +1215,20 @@ int main(void)
 
 		if (display_available && !display_sleeping && redraw && ((last_display_update_ms == INT64_MIN) ||
 			      ((now_ms - last_display_update_ms) >= STATUS_DISPLAY_REFRESH_INTERVAL_MS))) {
-			if (options_menu.open) {
-				const char *menu_labels[OPTIONS_MENU_ITEM_COUNT];
+			if (device_info.open) {
+				struct device_info_lines info_lines;
 
-				options_menu_labels(ui_state.operating_mode, menu_labels);
+				build_device_info_lines(&ui_state, &info_lines);
+				rc = status_display_render_info("Device Info", info_lines.lines,
+					DEVICE_INFO_LINE_COUNT, device_info.first_visible_index);
+			} else if (options_menu.open) {
+				const char *menu_labels[OPTIONS_MENU_MAX_ITEM_COUNT];
+				size_t item_count;
+
+				options_menu_clamp(&options_menu, ui_state.operating_mode);
+				item_count = options_menu_labels(ui_state.operating_mode, menu_labels);
 				rc = status_display_render_menu("Options", menu_labels,
-					ARRAY_SIZE(menu_labels), options_menu.selected_index,
+					item_count, options_menu.selected_index,
 					options_menu.first_visible_index);
 			} else {
 				const struct status_display_state display_state =
@@ -1146,8 +1360,15 @@ int main(void)
 				continue;
 			}
 
+			if (device_info.open) {
+				device_info_move(&device_info, encoder_delta);
+				redraw = true;
+				continue;
+			}
+
 			if (options_menu.open) {
-				options_menu_move(&options_menu, encoder_delta);
+				options_menu_move(&options_menu, ui_state.operating_mode,
+					encoder_delta);
 				redraw = true;
 				continue;
 			}
@@ -1182,9 +1403,29 @@ int main(void)
 				continue;
 			}
 
+			if (device_info.open) {
+				device_info_close(&device_info);
+				if (!options_menu.open) {
+					options_menu_open(&options_menu, ui_state.operating_mode);
+				}
+				redraw = true;
+				continue;
+			}
+
 			if (options_menu.open) {
-				const struct options_menu_item *selected =
-					&options_menu_items[options_menu.selected_index];
+				const struct options_menu_item *items;
+				const struct options_menu_item *selected;
+				size_t item_count;
+
+				options_menu_clamp(&options_menu, ui_state.operating_mode);
+				items = options_menu_items_for_mode(ui_state.operating_mode,
+					&item_count);
+				if (item_count == 0U) {
+					options_menu_close(&options_menu);
+					redraw = true;
+					continue;
+				}
+				selected = &items[options_menu.selected_index];
 
 				if (selected->action == OPTIONS_MENU_ACTION_SWITCH_MODE) {
 					enum macropad_operating_mode target_mode =
@@ -1204,6 +1445,8 @@ int main(void)
 					if (rc != 0) {
 						LOG_ERR("forget_ble_pairing failed: %d", rc);
 					}
+				} else if (selected->action == OPTIONS_MENU_ACTION_DEVICE_INFO) {
+					device_info_open(&device_info);
 				} else {
 					options_menu_close(&options_menu);
 				}
@@ -1219,6 +1462,10 @@ int main(void)
 			}
 			redraw = true;
 		} else if (event.type == APP_EVENT_MACROPAD_KEYS) {
+			if (device_info.open) {
+				redraw = true;
+				continue;
+			}
 			macropad_input_state.keys = event.keys;
 			rc = key_leds_update(macropad_input_state.keys);
 			if (rc != 0) {

@@ -1263,6 +1263,78 @@ int status_display_render_menu(const char *title, const char *const *items,
 	return rc;
 }
 
+int status_display_render_info(const char *title, const char *const *lines,
+			       size_t line_count, size_t first_visible_index)
+{
+	size_t visible_rows;
+	size_t last_visible_index;
+	size_t max_first;
+	int rc;
+
+	if ((title == NULL) || ((lines == NULL) && (line_count != 0U))) {
+		return -EINVAL;
+	}
+
+	visible_rows = status_display_menu_visible_rows();
+	if (visible_rows >= line_count) {
+		first_visible_index = 0U;
+	} else {
+		max_first = line_count - visible_rows;
+		if (first_visible_index > max_first) {
+			first_visible_index = max_first;
+		}
+	}
+	last_visible_index = MIN(line_count, first_visible_index + visible_rows);
+
+	rc = cfb_framebuffer_clear(display, false);
+	if (rc != 0) {
+		LOG_ERR("cfb_framebuffer_clear failed: %d", rc);
+		return rc;
+	}
+
+	rc = draw_compact_text_clipped(MENU_TITLE_X, MENU_TITLE_Y, title,
+		(display_width_px > MENU_TITLE_X) ?
+			(uint16_t)(display_width_px - MENU_TITLE_X) : 0U);
+	if (rc != 0) {
+		return rc;
+	}
+
+	if (first_visible_index > 0U) {
+		rc = draw_scroll_cue(MENU_TITLE_Y, true);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+	if (last_visible_index < line_count) {
+		rc = draw_scroll_cue((uint16_t)(MENU_FIRST_ITEM_Y +
+			((visible_rows - 1U) * COMPACT_LINE_HEIGHT)), false);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	for (size_t index = first_visible_index; index < last_visible_index; ++index) {
+		uint16_t y = MENU_FIRST_ITEM_Y +
+			(uint16_t)((index - first_visible_index) * COMPACT_LINE_HEIGHT);
+
+		rc = draw_compact_text_clipped(MENU_ITEM_X, y, lines[index],
+			(display_width_px > (MENU_ITEM_X + MENU_SCROLL_CUE_WIDTH +
+					     DISPLAY_MARGIN_X)) ?
+				(uint16_t)(display_width_px - MENU_ITEM_X -
+					MENU_SCROLL_CUE_WIDTH - DISPLAY_MARGIN_X) : 0U);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	rc = cfb_framebuffer_finalize(display);
+	if (rc != 0) {
+		LOG_ERR("cfb_framebuffer_finalize failed: %d", rc);
+	}
+
+	return rc;
+}
+
 int status_display_render_message(const char *line1, const char *line2)
 {
 	uint16_t y;

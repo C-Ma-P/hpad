@@ -26,6 +26,8 @@ int status_display_render(const struct status_display_state *state);
 int status_display_render_menu(const char *title, const char *const *items,
 			       size_t item_count, size_t selected_index,
 			       size_t first_visible_index);
+int status_display_render_info(const char *title, const char *const *lines,
+			       size_t line_count, size_t first_visible_index);
 int status_display_render_message(const char *line1, const char *line2);
 size_t status_display_menu_visible_rows(void);
 void status_display_menu_clamp_viewport(size_t item_count, size_t selected_index,
