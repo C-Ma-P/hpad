@@ -430,14 +430,17 @@ static void options_menu_move(struct options_menu_state *menu,
 	options_menu_clamp(menu, current_mode);
 
 	while (delta > 0) {
-		menu->selected_index = (menu->selected_index + 1U) % item_count;
+		if (menu->selected_index < (item_count - 1U)) {
+			menu->selected_index++;
+		}
 		status_display_menu_clamp_viewport(item_count,
 			menu->selected_index, &menu->first_visible_index);
 		delta--;
 	}
 	while (delta < 0) {
-		menu->selected_index = (menu->selected_index == 0U) ?
-			(item_count - 1U) : (menu->selected_index - 1U);
+		if (menu->selected_index > 0U) {
+			menu->selected_index--;
+		}
 		status_display_menu_clamp_viewport(item_count,
 			menu->selected_index, &menu->first_visible_index);
 		delta++;
