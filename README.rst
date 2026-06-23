@@ -1,30 +1,22 @@
-.. zephyr:code-sample:: character-frame-buffer
-   :name: Character frame buffer
-   :relevant-api: monochrome_character_framebuffer
+hpadv2
+======
 
-   Display character strings using the Character Frame Buffer (CFB).
+Zephyr firmware for the wireless macropad.
 
-Overview
-********
+Build
+-----
 
-This sample displays character strings using the Character Frame Buffer
-(CFB) subsystem framework.
+From a Zephyr environment:
 
-Requirements
-************
+.. code-block:: sh
 
-This sample requires a supported board and CFB-supporting
-display, such as the :ref:`reel_board`.
+   west build -b <board> .
 
-Building and Running
-********************
+Flash
+-----
 
-Build this sample application with the following commands:
+Use the normal Zephyr flash command for the selected board:
 
-.. zephyr-app-commands::
-   :zephyr-app: samples/subsys/display/cfb
-   :board: reel_board
-   :goals: build
-   :compact:
+.. code-block:: sh
 
-See :ref:`reel_board` on how to flash the build.
+   west flash
