@@ -10,10 +10,19 @@ enum macropad_operating_mode {
 	MACROPAD_OPERATING_MODE_BLE = 1,
 };
 
+enum macropad_ble_feedback {
+	MACROPAD_BLE_FEEDBACK_BUZZ = 0,
+	MACROPAD_BLE_FEEDBACK_LED_LOW = 1,
+	MACROPAD_BLE_FEEDBACK_LED_MED = 2,
+	MACROPAD_BLE_FEEDBACK_LED_HIGH = 3,
+};
+
 int macropad_config_init(void);
 const macropad_config_t *macropad_config_get(void);
 int macropad_config_store(const macropad_config_t *config);
 enum macropad_operating_mode macropad_config_get_operating_mode(void);
 int macropad_config_store_operating_mode(enum macropad_operating_mode mode);
+enum macropad_ble_feedback macropad_config_get_ble_feedback(void);
+int macropad_config_store_ble_feedback(enum macropad_ble_feedback feedback);
 
 #endif

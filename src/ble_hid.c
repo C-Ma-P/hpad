@@ -25,18 +25,41 @@ LOG_MODULE_REGISTER(ble_hid, LOG_LEVEL_INF);
 #define INPUT_REP_KEYS_IDX 0
 #define INPUT_REP_KEYS_REF_ID 0
 #define INPUT_REP_KEYS_LEN 8
+#define HID_KEY_ARRAY_OFFSET 2U
+#define HID_KEY_ARRAY_LEN 6U
+#define KEY_1_MASK BIT(0)
+#define KEY_2_MASK BIT(1)
+#define KEY_3_MASK BIT(2)
 #define KEY_4_MASK BIT(3)
+#define KEY_5_MASK BIT(4)
 #define KEY_6_MASK BIT(5)
+#define HID_USAGE_KEYBOARD_ESCAPE 0x29
+#define HID_USAGE_KEYBOARD_HOME 0x4A
 #define HID_USAGE_KEYBOARD_PAGE_UP 0x4B
 #define HID_USAGE_KEYBOARD_PAGE_DOWN 0x4E
 
 BT_HIDS_DEF(hids_obj, INPUT_REP_KEYS_LEN);
+
+struct ble_hid_key_mapping {
+	uint8_t key_mask;
+	uint8_t usage;
+};
+
+static const struct ble_hid_key_mapping kindle_key_mappings[] = {
+	{ .key_mask = KEY_1_MASK, .usage = HID_USAGE_KEYBOARD_HOME },
+	{ .key_mask = KEY_2_MASK, .usage = HID_USAGE_KEYBOARD_ESCAPE },
+	{ .key_mask = KEY_3_MASK, .usage = BLE_HID_USAGE_KEYBOARD_UP_ARROW },
+	{ .key_mask = KEY_4_MASK, .usage = HID_USAGE_KEYBOARD_PAGE_DOWN },
+	{ .key_mask = KEY_5_MASK, .usage = BLE_HID_USAGE_KEYBOARD_DOWN_ARROW },
+	{ .key_mask = KEY_6_MASK, .usage = HID_USAGE_KEYBOARD_PAGE_UP },
+};
 
 static struct bt_conn *active_conn;
 static bool hids_initialized;
 static bool advertising;
 static bool ble_active;
 static bool protocol_boot;
+static uint8_t current_matrix_keys;
 static uint8_t last_report[INPUT_REP_KEYS_LEN];
 static atomic_t ble_state = ATOMIC_INIT(BLE_HID_STATE_INACTIVE);
 
@@ -156,6 +179,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	}
 
 	memset(last_report, 0, sizeof(last_report));
+	current_matrix_keys = 0U;
 	LOG_INF("BLE HID disconnected reason=0x%02x", reason);
 
 	if (ble_active) {
@@ -257,6 +281,88 @@ static int hids_init_once(void)
 	return 0;
 }
 
+static bool report_contains_usage(const uint8_t report[INPUT_REP_KEYS_LEN], uint8_t usage)
+{
+	for (size_t index = 0U; index < HID_KEY_ARRAY_LEN; ++index) {
+		if (report[HID_KEY_ARRAY_OFFSET + index] == usage) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static int report_append_usage(uint8_t report[INPUT_REP_KEYS_LEN], uint8_t usage)
+{
+	if (usage == 0U) {
+		return 0;
+	}
+
+	if (report_contains_usage(report, usage)) {
+		return 0;
+	}
+
+	for (size_t index = 0U; index < HID_KEY_ARRAY_LEN; ++index) {
+		size_t report_index = HID_KEY_ARRAY_OFFSET + index;
+
+		if (report[report_index] == 0U) {
+			report[report_index] = usage;
+			return 0;
+		}
+	}
+
+	return -ENOMEM;
+}
+
+static int build_report_from_matrix_keys(uint8_t keys, uint8_t report[INPUT_REP_KEYS_LEN])
+{
+	memset(report, 0, INPUT_REP_KEYS_LEN);
+
+	for (size_t index = 0U; index < ARRAY_SIZE(kindle_key_mappings); ++index) {
+		if ((keys & kindle_key_mappings[index].key_mask) == 0U) {
+			continue;
+		}
+
+		int rc = report_append_usage(report, kindle_key_mappings[index].usage);
+
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	return 0;
+}
+
+static int ble_hid_send_report(const uint8_t report[INPUT_REP_KEYS_LEN], bool force)
+{
+	int rc;
+
+	if (!ble_active) {
+		return -EAGAIN;
+	}
+	if (active_conn == NULL) {
+		return -ENOTCONN;
+	}
+
+	if (!force && (memcmp(last_report, report, sizeof(last_report)) == 0)) {
+		return 0;
+	}
+
+	if (protocol_boot) {
+		rc = bt_hids_boot_kb_inp_rep_send(&hids_obj, active_conn,
+			report, INPUT_REP_KEYS_LEN, NULL);
+	} else {
+		rc = bt_hids_inp_rep_send(&hids_obj, active_conn,
+			INPUT_REP_KEYS_IDX, report, INPUT_REP_KEYS_LEN, NULL);
+	}
+	if (rc != 0) {
+		return rc;
+	}
+
+	memcpy(last_report, report, sizeof(last_report));
+	return 0;
+}
+
 int ble_hid_start(void)
 {
 	int rc;
@@ -270,6 +376,7 @@ int ble_hid_start(void)
 	}
 
 	ble_active = true;
+	current_matrix_keys = 0U;
 	memset(last_report, 0, sizeof(last_report));
 
 	if (!bt_is_ready()) {
@@ -315,6 +422,7 @@ int ble_hid_stop(void)
 	}
 
 	memset(last_report, 0, sizeof(last_report));
+	current_matrix_keys = 0U;
 	protocol_boot = false;
 
 	if (!bt_is_ready()) {
@@ -360,6 +468,7 @@ int ble_hid_forget_pairing(void)
 	}
 
 	memset(last_report, 0, sizeof(last_report));
+	current_matrix_keys = 0U;
 	protocol_boot = false;
 
 	rc = bt_unpair(BT_ID_DEFAULT, NULL);
@@ -389,37 +498,42 @@ int ble_hid_send_key_state(uint8_t keys)
 	uint8_t report[INPUT_REP_KEYS_LEN] = { 0 };
 	int rc;
 
-	if (!ble_active) {
-		return -EAGAIN;
-	}
-	if (active_conn == NULL) {
-		return -ENOTCONN;
-	}
-
-	if ((keys & KEY_4_MASK) != 0U) {
-		report[2] = HID_USAGE_KEYBOARD_PAGE_DOWN;
-	}
-	if ((keys & KEY_6_MASK) != 0U) {
-		report[3] = HID_USAGE_KEYBOARD_PAGE_UP;
-	}
-
-	if (memcmp(last_report, report, sizeof(report)) == 0) {
-		return 0;
-	}
-
-	if (protocol_boot) {
-		rc = bt_hids_boot_kb_inp_rep_send(&hids_obj, active_conn,
-			report, sizeof(report), NULL);
-	} else {
-		rc = bt_hids_inp_rep_send(&hids_obj, active_conn,
-			INPUT_REP_KEYS_IDX, report, sizeof(report), NULL);
-	}
+	rc = build_report_from_matrix_keys(keys, report);
 	if (rc != 0) {
 		return rc;
 	}
 
-	memcpy(last_report, report, sizeof(last_report));
-	return 0;
+	rc = ble_hid_send_report(report, false);
+	if (rc == 0) {
+		current_matrix_keys = keys;
+	}
+
+	return rc;
+}
+
+int ble_hid_send_key_tap(uint8_t usage)
+{
+	uint8_t report[INPUT_REP_KEYS_LEN] = { 0 };
+	uint8_t restored_report[INPUT_REP_KEYS_LEN] = { 0 };
+	int rc;
+
+	rc = build_report_from_matrix_keys(current_matrix_keys, report);
+	if (rc != 0) {
+		return rc;
+	}
+
+	memcpy(restored_report, report, sizeof(restored_report));
+	rc = report_append_usage(report, usage);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = ble_hid_send_report(report, true);
+	if (rc != 0) {
+		return rc;
+	}
+
+	return ble_hid_send_report(restored_report, true);
 }
 
 bool ble_hid_is_connected(void)

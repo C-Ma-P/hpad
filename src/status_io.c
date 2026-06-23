@@ -45,6 +45,7 @@ static const struct gpio_dt_spec led_pwr_enable =
 #endif
 
 static struct k_work_delayable status_led_off_work;
+static struct k_work_delayable buzzer_off_work;
 
 static void set_status_led(bool on)
 {
@@ -59,6 +60,12 @@ static void status_led_off_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 	set_status_led(false);
+}
+
+static void buzzer_off_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	status_buzzer_set(false);
 }
 
 void status_led_set(bool on)
@@ -107,6 +114,7 @@ int status_buzzer_init(void)
 		return -ENODEV;
 	}
 
+	k_work_init_delayable(&buzzer_off_work, buzzer_off_work_handler);
 	return gpio_pin_configure_dt(&buzzer, GPIO_OUTPUT_INACTIVE);
 #else
 	return -ENOTSUP;
@@ -119,6 +127,16 @@ void status_buzzer_set(bool on)
 	(void)gpio_pin_set_dt(&buzzer, on ? 1 : 0);
 #else
 	ARG_UNUSED(on);
+#endif
+}
+
+void status_buzzer_pulse(uint32_t pulse_ms)
+{
+#if HAVE_BUZZER
+	status_buzzer_set(true);
+	(void)k_work_reschedule(&buzzer_off_work, K_MSEC(pulse_ms));
+#else
+	ARG_UNUSED(pulse_ms);
 #endif
 }
 

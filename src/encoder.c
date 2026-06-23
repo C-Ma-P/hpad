@@ -9,6 +9,8 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
 
+#include <hal/nrf_gpio.h>
+
 LOG_MODULE_REGISTER(encoder, LOG_LEVEL_INF);
 
 #if DT_HAS_ALIAS(encoder_a) && DT_HAS_ALIAS(encoder_b) && DT_HAS_ALIAS(encoder_button)
@@ -21,6 +23,15 @@ LOG_MODULE_REGISTER(encoder, LOG_LEVEL_INF);
 static const struct gpio_dt_spec encoder_a = GPIO_DT_SPEC_GET(ENCODER_A_NODE, gpios);
 static const struct gpio_dt_spec encoder_b = GPIO_DT_SPEC_GET(ENCODER_B_NODE, gpios);
 static const struct gpio_dt_spec encoder_button = GPIO_DT_SPEC_GET(ENCODER_BUTTON_NODE, gpios);
+
+#if DT_SAME_NODE(DT_GPIO_CTLR(ENCODER_BUTTON_NODE, gpios), DT_NODELABEL(gpio1))
+#define ENCODER_BUTTON_PORT_NUM 1U
+#else
+#define ENCODER_BUTTON_PORT_NUM 0U
+#endif
+
+#define ENCODER_BUTTON_ABS_PIN \
+	NRF_GPIO_PIN_MAP(ENCODER_BUTTON_PORT_NUM, DT_GPIO_PIN(ENCODER_BUTTON_NODE, gpios))
 
 static struct gpio_callback encoder_a_gpio_cb;
 static struct gpio_callback encoder_b_gpio_cb;
@@ -143,6 +154,60 @@ static void encoder_button_gpio_handler(const struct device *port, struct gpio_c
 	(void)k_work_reschedule(&encoder_button_work, K_MSEC(ENCODER_BUTTON_DEBOUNCE_MS));
 }
 
+int encoder_button_configure_for_early_read(void)
+{
+	if (!gpio_is_ready_dt(&encoder_button)) {
+		return -ENODEV;
+	}
+
+	return gpio_pin_configure(encoder_button.port, encoder_button.pin,
+				  GPIO_INPUT | GPIO_PULL_UP);
+}
+
+int encoder_button_is_pressed(bool *pressed)
+{
+	int raw_state;
+	int rc;
+
+	if (pressed == NULL) {
+		return -EINVAL;
+	}
+
+	rc = encoder_button_configure_for_early_read();
+	if (rc != 0) {
+		return rc;
+	}
+
+	raw_state = gpio_pin_get_raw(encoder_button.port, encoder_button.pin);
+	if (raw_state < 0) {
+		return raw_state;
+	}
+
+	/* Encoder switch is wired to short the pin to GND when pressed. */
+	*pressed = (raw_state == 0);
+	return 0;
+}
+
+int encoder_button_configure_system_off_wake(void)
+{
+	int rc;
+
+	rc = encoder_button_configure_for_early_read();
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = gpio_pin_interrupt_configure(encoder_button.port, encoder_button.pin,
+					  GPIO_INT_DISABLE);
+	if (rc != 0) {
+		return rc;
+	}
+
+	nrf_gpio_cfg_sense_input(ENCODER_BUTTON_ABS_PIN, NRF_GPIO_PIN_PULLUP,
+				 NRF_GPIO_PIN_SENSE_LOW);
+	return 0;
+}
+
 int encoder_init(encoder_delta_callback_t delta_callback,
 		 encoder_button_callback_t button_callback)
 {
@@ -239,6 +304,22 @@ int encoder_init(encoder_delta_callback_t delta_callback,
 {
 	ARG_UNUSED(delta_callback);
 	ARG_UNUSED(button_callback);
+	return -ENOTSUP;
+}
+
+int encoder_button_configure_for_early_read(void)
+{
+	return -ENOTSUP;
+}
+
+int encoder_button_is_pressed(bool *pressed)
+{
+	ARG_UNUSED(pressed);
+	return -ENOTSUP;
+}
+
+int encoder_button_configure_system_off_wake(void)
+{
 	return -ENOTSUP;
 }
 #endif

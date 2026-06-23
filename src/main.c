@@ -16,6 +16,8 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/poweroff.h>
 
+#include <hal/nrf_power.h>
+
 #if defined(CONFIG_MPSL_DYNAMIC_INTERRUPTS)
 #include <mpsl.h>
 #include <mpsl/mpsl_lib.h>
@@ -51,10 +53,15 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define BATTERY_POWEROFF_SUSTAIN_MS 60000
 #define BATTERY_CRITICAL_BLINK_MS 500
 #define ENCODER_LONG_PRESS_MS 700
-#define OPTIONS_MENU_MAX_ITEM_COUNT 4U
+#define OPTIONS_MENU_MAX_ITEM_COUNT 6U
+#define POWER_CONFIRM_ITEM_COUNT 2U
+#define FEEDBACK_ITEM_COUNT 4U
 #define DEVICE_INFO_LINE_COUNT 5U
 #define DEVICE_INFO_LINE_MAX_LEN 64U
 #define TRANSIENT_MESSAGE_HOLD_MS 700
+#define FEEDBACK_PREVIEW_MS 80
+#define POWEROFF_RELEASE_WAIT_MS 10
+#define WAKE_HOLD_POLL_MS 10
 
 static struct k_spinlock input_state_lock;
 
@@ -89,8 +96,10 @@ struct app_ui_state {
 enum options_menu_action {
 	OPTIONS_MENU_ACTION_SWITCH_MODE = 0,
 	OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING = 1,
-	OPTIONS_MENU_ACTION_DEVICE_INFO = 2,
-	OPTIONS_MENU_ACTION_CLOSE = 3,
+	OPTIONS_MENU_ACTION_FEEDBACK = 2,
+	OPTIONS_MENU_ACTION_DEVICE_INFO = 3,
+	OPTIONS_MENU_ACTION_POWER_OFF = 4,
+	OPTIONS_MENU_ACTION_CLOSE = 5,
 };
 
 struct options_menu_item {
@@ -105,6 +114,12 @@ struct options_menu_state {
 
 struct device_info_state {
 	bool open;
+	size_t first_visible_index;
+};
+
+struct modal_menu_state {
+	bool open;
+	size_t selected_index;
 	size_t first_visible_index;
 };
 
@@ -139,14 +154,29 @@ static bool encoder_delta_event_pending;
 static const struct options_menu_item options_menu_dongle_items[] = {
 	{ .action = OPTIONS_MENU_ACTION_SWITCH_MODE },
 	{ .action = OPTIONS_MENU_ACTION_DEVICE_INFO },
+	{ .action = OPTIONS_MENU_ACTION_POWER_OFF },
 	{ .action = OPTIONS_MENU_ACTION_CLOSE },
 };
 
 static const struct options_menu_item options_menu_ble_items[] = {
 	{ .action = OPTIONS_MENU_ACTION_SWITCH_MODE },
+	{ .action = OPTIONS_MENU_ACTION_FEEDBACK },
 	{ .action = OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING },
 	{ .action = OPTIONS_MENU_ACTION_DEVICE_INFO },
+	{ .action = OPTIONS_MENU_ACTION_POWER_OFF },
 	{ .action = OPTIONS_MENU_ACTION_CLOSE },
+};
+
+static const char *const power_confirm_labels[POWER_CONFIRM_ITEM_COUNT] = {
+	"Cancel",
+	"Confirm",
+};
+
+static const char *const feedback_labels[FEEDBACK_ITEM_COUNT] = {
+	"Buzz",
+	"Low",
+	"Med",
+	"High",
 };
 
 static void handle_radio_delivery(enum radio_esb_tx_kind kind, bool acked);
@@ -352,8 +382,12 @@ static const char *options_menu_action_label(enum options_menu_action action,
 		return mode_menu_label(current_mode);
 	case OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING:
 		return "Forget Pairing";
+	case OPTIONS_MENU_ACTION_FEEDBACK:
+		return "Feedback";
 	case OPTIONS_MENU_ACTION_DEVICE_INFO:
 		return "Device Info";
+	case OPTIONS_MENU_ACTION_POWER_OFF:
+		return "Power Off";
 	case OPTIONS_MENU_ACTION_CLOSE:
 	default:
 		return "Close";
@@ -482,6 +516,122 @@ static void device_info_move(struct device_info_state *info, int32_t delta)
 	while ((delta < 0) && (info->first_visible_index > 0U)) {
 		info->first_visible_index--;
 		delta++;
+	}
+}
+
+static void modal_menu_open(struct modal_menu_state *menu, size_t selected_index)
+{
+	menu->open = true;
+	menu->selected_index = selected_index;
+	menu->first_visible_index = 0U;
+}
+
+static void modal_menu_close(struct modal_menu_state *menu)
+{
+	menu->open = false;
+	menu->selected_index = 0U;
+	menu->first_visible_index = 0U;
+}
+
+static void modal_menu_move(struct modal_menu_state *menu, size_t item_count, int32_t delta)
+{
+	if (!menu->open || (delta == 0) || (item_count == 0U)) {
+		return;
+	}
+
+	if (menu->selected_index >= item_count) {
+		menu->selected_index = item_count - 1U;
+	}
+
+	while (delta > 0) {
+		if (menu->selected_index < (item_count - 1U)) {
+			menu->selected_index++;
+		}
+		delta--;
+	}
+	while (delta < 0) {
+		if (menu->selected_index > 0U) {
+			menu->selected_index--;
+		}
+		delta++;
+	}
+
+	status_display_menu_clamp_viewport(item_count, menu->selected_index,
+		&menu->first_visible_index);
+}
+
+static enum macropad_ble_feedback feedback_from_index(size_t index)
+{
+	switch (index) {
+	case 0U:
+		return MACROPAD_BLE_FEEDBACK_BUZZ;
+	case 1U:
+		return MACROPAD_BLE_FEEDBACK_LED_LOW;
+	case 3U:
+		return MACROPAD_BLE_FEEDBACK_LED_HIGH;
+	case 2U:
+	default:
+		return MACROPAD_BLE_FEEDBACK_LED_MED;
+	}
+}
+
+static size_t feedback_index(enum macropad_ble_feedback feedback)
+{
+	switch (feedback) {
+	case MACROPAD_BLE_FEEDBACK_BUZZ:
+		return 0U;
+	case MACROPAD_BLE_FEEDBACK_LED_LOW:
+		return 1U;
+	case MACROPAD_BLE_FEEDBACK_LED_HIGH:
+		return 3U;
+	case MACROPAD_BLE_FEEDBACK_LED_MED:
+	default:
+		return 2U;
+	}
+}
+
+static bool local_overlay_open(const struct options_menu_state *options_menu,
+			       const struct device_info_state *device_info,
+			       const struct modal_menu_state *feedback_menu,
+			       const struct modal_menu_state *power_confirm)
+{
+	return options_menu->open || device_info->open ||
+		feedback_menu->open || power_confirm->open;
+}
+
+static bool ble_feedback_uses_buzzer(enum macropad_ble_feedback feedback)
+{
+	return feedback == MACROPAD_BLE_FEEDBACK_BUZZ;
+}
+
+static int apply_key_feedback(enum macropad_operating_mode mode,
+			      enum macropad_ble_feedback ble_feedback,
+			      uint8_t keys)
+{
+	if (mode == MACROPAD_OPERATING_MODE_BLE) {
+		return key_leds_update_ble_feedback(keys, ble_feedback);
+	}
+
+	return key_leds_update(keys);
+}
+
+static void preview_ble_feedback(enum macropad_ble_feedback feedback)
+{
+	int rc;
+
+	if (feedback == MACROPAD_BLE_FEEDBACK_BUZZ) {
+		rc = key_leds_set_all(0U, 0U, 0U);
+		if ((rc != 0) && (rc != -ENOTSUP)) {
+			LOG_WRN("Failed to clear LEDs before buzz preview: %d", rc);
+		}
+		status_buzzer_pulse(FEEDBACK_PREVIEW_MS);
+		return;
+	}
+
+	status_buzzer_set(false);
+	rc = key_leds_preview_ble_feedback(feedback);
+	if ((rc != 0) && (rc != -ENOTSUP)) {
+		LOG_WRN("Failed to preview BLE feedback LEDs: %d", rc);
 	}
 }
 
@@ -674,6 +824,77 @@ static int save_runtime_state(void)
 	return 0;
 }
 
+static bool booted_from_system_off(void)
+{
+	uint32_t reset_reasons = nrf_power_resetreas_get(NRF_POWER);
+	bool from_system_off = (reset_reasons & NRF_POWER_RESETREAS_OFF_MASK) != 0U;
+
+	if (reset_reasons != 0U) {
+		nrf_power_resetreas_clear(NRF_POWER, reset_reasons);
+	}
+
+	return from_system_off;
+}
+
+static void enter_system_off(void)
+{
+	int rc = encoder_button_configure_system_off_wake();
+
+	if (rc != 0) {
+		LOG_ERR("Failed to configure encoder wake source: %d", rc);
+	}
+
+	sys_poweroff();
+}
+
+static void wait_for_encoder_release_before_poweroff(void)
+{
+	while (true) {
+		bool pressed = false;
+		int rc = encoder_button_is_pressed(&pressed);
+
+		if (rc != 0) {
+			LOG_WRN("Failed to read encoder button before poweroff: %d", rc);
+			return;
+		}
+		if (!pressed) {
+			return;
+		}
+
+		k_msleep(POWEROFF_RELEASE_WAIT_MS);
+	}
+}
+
+static void enforce_system_off_wake_hold(void)
+{
+	bool pressed = false;
+	int rc;
+	int64_t hold_start_ms;
+
+	if (!booted_from_system_off()) {
+		return;
+	}
+
+	rc = encoder_button_is_pressed(&pressed);
+	if ((rc != 0) || !pressed) {
+		LOG_INF("System OFF wake without held encoder; returning to System OFF");
+		enter_system_off();
+	}
+
+	hold_start_ms = k_uptime_get();
+	while ((k_uptime_get() - hold_start_ms) < ENCODER_LONG_PRESS_MS) {
+		rc = encoder_button_is_pressed(&pressed);
+		if ((rc != 0) || !pressed) {
+			LOG_INF("System OFF wake hold was released early; returning to System OFF");
+			enter_system_off();
+		}
+		k_msleep(WAKE_HOLD_POLL_MS);
+	}
+
+	LOG_INF("System OFF wake hold accepted");
+	wait_for_encoder_release_before_poweroff();
+}
+
 static void prepare_for_poweroff(bool display_available)
 {
 	int rc;
@@ -704,6 +925,40 @@ static void prepare_for_poweroff(bool display_available)
 	}
 }
 
+static void perform_user_poweroff(enum macropad_operating_mode mode,
+				  bool display_available,
+				  bool *display_sleeping)
+{
+	static const char *const shutdown_lines[] = {
+		"Hold encoder",
+		"to wake",
+	};
+	int rc;
+
+	if (display_available) {
+		if ((display_sleeping != NULL) && *display_sleeping) {
+			(void)status_display_unblank();
+			*display_sleeping = false;
+		}
+
+		rc = status_display_render_info("Powering Off", shutdown_lines,
+			ARRAY_SIZE(shutdown_lines), 0U);
+		if (rc != 0) {
+			LOG_WRN("Shutdown display message failed: %d", rc);
+		}
+		k_msleep(250);
+	}
+	wait_for_encoder_release_before_poweroff();
+
+	rc = stop_transport(mode);
+	if (rc != 0) {
+		LOG_WRN("Failed to stop active transport before poweroff: %d", rc);
+	}
+
+	prepare_for_poweroff(display_available);
+	enter_system_off();
+}
+
 static void enforce_battery_policy(bool usb_power_present,
 				   bool display_available,
 				   bool *warning_logged)
@@ -722,7 +977,7 @@ static void enforce_battery_policy(bool usb_power_present,
 			battery_policy_state.filtered_mv,
 			(unsigned int)BATTERY_POWEROFF_SUSTAIN_MS);
 		prepare_for_poweroff(display_available);
-		sys_poweroff();
+		enter_system_off();
 	}
 }
 
@@ -1050,6 +1305,8 @@ int main(void)
 
 	//return macropad_keys_led_smoke_test();
 
+	enforce_system_off_wake_hold();
+
 	struct app_event event;
 	struct app_ui_state ui_state = {
 		.operating_mode = MACROPAD_OPERATING_MODE_DONGLE,
@@ -1069,6 +1326,16 @@ int main(void)
 		.open = false,
 		.first_visible_index = 0U,
 	};
+	struct modal_menu_state feedback_menu = {
+		.open = false,
+		.selected_index = 0U,
+		.first_visible_index = 0U,
+	};
+	struct modal_menu_state power_confirm = {
+		.open = false,
+		.selected_index = 0U,
+		.first_visible_index = 0U,
+	};
 	int64_t next_heartbeat_ms = 0;
 	int64_t last_display_update_ms = INT64_MIN;
 	int64_t last_activity_ms = 0;
@@ -1079,6 +1346,7 @@ int main(void)
 	bool redraw = true;
 	bool encoder_button_down = false;
 	bool encoder_long_press_consumed = false;
+	enum macropad_ble_feedback ble_feedback = MACROPAD_BLE_FEEDBACK_LED_MED;
 	int rc;
 
 	rc = status_led_init();
@@ -1098,6 +1366,7 @@ int main(void)
 		LOG_INF("Macropad LED config unavailable (rc=%d)", rc);
 	}
 	ui_state.operating_mode = macropad_config_get_operating_mode();
+	ble_feedback = macropad_config_get_ble_feedback();
 
 	rc = key_leds_init();
 	if (rc != 0) {
@@ -1150,7 +1419,8 @@ int main(void)
 		LOG_INF("Macropad keys disabled");
 	} else {
 		macropad_input_state.keys = macropad_keys_get_pressed_mask();
-		rc = key_leds_update(macropad_input_state.keys);
+		rc = apply_key_feedback(ui_state.operating_mode, ble_feedback,
+			macropad_input_state.keys);
 		if (rc != 0) {
 			LOG_WRN("Failed to initialize macropad LEDs: %d", rc);
 		}
@@ -1188,7 +1458,15 @@ int main(void)
 
 		if (encoder_button_down && !encoder_long_press_consumed &&
 		    ((now_ms - encoder_button_down_ms) >= ENCODER_LONG_PRESS_MS)) {
-			if (device_info.open) {
+			if (power_confirm.open) {
+				modal_menu_close(&power_confirm);
+				options_menu_close(&options_menu);
+			} else if (feedback_menu.open) {
+				modal_menu_close(&feedback_menu);
+				options_menu_close(&options_menu);
+				(void)apply_key_feedback(ui_state.operating_mode, ble_feedback,
+					macropad_input_state.keys);
+			} else if (device_info.open) {
 				device_info_close(&device_info);
 				options_menu_close(&options_menu);
 			} else if (options_menu.open) {
@@ -1218,7 +1496,17 @@ int main(void)
 
 		if (display_available && !display_sleeping && redraw && ((last_display_update_ms == INT64_MIN) ||
 			      ((now_ms - last_display_update_ms) >= STATUS_DISPLAY_REFRESH_INTERVAL_MS))) {
-			if (device_info.open) {
+			if (power_confirm.open) {
+				modal_menu_move(&power_confirm, POWER_CONFIRM_ITEM_COUNT, 0);
+				rc = status_display_render_menu("Power Off?", power_confirm_labels,
+					POWER_CONFIRM_ITEM_COUNT, power_confirm.selected_index,
+					power_confirm.first_visible_index);
+			} else if (feedback_menu.open) {
+				modal_menu_move(&feedback_menu, FEEDBACK_ITEM_COUNT, 0);
+				rc = status_display_render_menu("Feedback", feedback_labels,
+					FEEDBACK_ITEM_COUNT, feedback_menu.selected_index,
+					feedback_menu.first_visible_index);
+			} else if (device_info.open) {
 				struct device_info_lines info_lines;
 
 				build_device_info_lines(&ui_state, &info_lines);
@@ -1363,6 +1651,26 @@ int main(void)
 				continue;
 			}
 
+			if (power_confirm.open) {
+				modal_menu_move(&power_confirm, POWER_CONFIRM_ITEM_COUNT,
+					encoder_delta);
+				redraw = true;
+				continue;
+			}
+
+			if (feedback_menu.open) {
+				size_t previous_index = feedback_menu.selected_index;
+
+				modal_menu_move(&feedback_menu, FEEDBACK_ITEM_COUNT,
+					encoder_delta);
+				if (feedback_menu.selected_index != previous_index) {
+					preview_ble_feedback(
+						feedback_from_index(feedback_menu.selected_index));
+				}
+				redraw = true;
+				continue;
+			}
+
 			if (device_info.open) {
 				device_info_move(&device_info, encoder_delta);
 				redraw = true;
@@ -1384,13 +1692,30 @@ int main(void)
 				if (rc != 0) {
 					LOG_ERR("send_encoder_delta_reports failed: %d", rc);
 				}
+			} else {
+				while (encoder_delta != 0) {
+					uint8_t usage = (encoder_delta > 0) ?
+						BLE_HID_USAGE_KEYBOARD_DOWN_ARROW :
+						BLE_HID_USAGE_KEYBOARD_UP_ARROW;
+
+					rc = ble_hid_send_key_tap(usage);
+					if ((rc != 0) && (rc != -ENOTCONN) &&
+					    (rc != -EAGAIN)) {
+						LOG_ERR("ble_hid_send_key_tap failed: %d", rc);
+						break;
+					}
+					encoder_delta += (encoder_delta > 0) ? -1 : 1;
+				}
 			}
 		} else if (event.type == APP_EVENT_ENCODER_BUTTON) {
 			if (event.pressed != 0U) {
 				encoder_button_down = true;
 				encoder_button_down_ms = now_ms;
 				encoder_long_press_consumed = false;
-				status_buzzer_set(true);
+				if ((ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) ||
+				    ble_feedback_uses_buzzer(ble_feedback)) {
+					status_buzzer_set(true);
+				}
 				continue;
 			}
 
@@ -1403,6 +1728,38 @@ int main(void)
 			encoder_button_down_ms = INT64_MIN;
 			if (encoder_long_press_consumed) {
 				encoder_long_press_consumed = false;
+				continue;
+			}
+
+			if (power_confirm.open) {
+				bool confirmed = (power_confirm.selected_index == 1U);
+
+				modal_menu_close(&power_confirm);
+				if (confirmed) {
+					options_menu_close(&options_menu);
+					perform_user_poweroff(ui_state.operating_mode,
+						display_available, &display_sleeping);
+				}
+				redraw = true;
+				continue;
+			}
+
+			if (feedback_menu.open) {
+				enum macropad_ble_feedback selected_feedback =
+					feedback_from_index(feedback_menu.selected_index);
+
+				modal_menu_close(&feedback_menu);
+				rc = macropad_config_store_ble_feedback(selected_feedback);
+				if (rc != 0) {
+					LOG_WRN("Failed to persist BLE feedback: %d", rc);
+				}
+				ble_feedback = selected_feedback;
+				rc = apply_key_feedback(ui_state.operating_mode, ble_feedback,
+					macropad_input_state.keys);
+				if ((rc != 0) && (rc != -ENOTSUP)) {
+					LOG_WRN("Failed to apply BLE feedback: %d", rc);
+				}
+				redraw = true;
 				continue;
 			}
 
@@ -1440,6 +1797,11 @@ int main(void)
 					if (rc != 0) {
 						LOG_ERR("switch_operating_mode failed: %d", rc);
 					}
+					rc = apply_key_feedback(ui_state.operating_mode,
+						ble_feedback, macropad_input_state.keys);
+					if ((rc != 0) && (rc != -ENOTSUP)) {
+						LOG_WRN("Failed to refresh key feedback: %d", rc);
+					}
 				} else if (selected->action ==
 					   OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING) {
 					options_menu_close(&options_menu);
@@ -1448,8 +1810,13 @@ int main(void)
 					if (rc != 0) {
 						LOG_ERR("forget_ble_pairing failed: %d", rc);
 					}
+				} else if (selected->action == OPTIONS_MENU_ACTION_FEEDBACK) {
+					modal_menu_open(&feedback_menu, feedback_index(ble_feedback));
+					preview_ble_feedback(ble_feedback);
 				} else if (selected->action == OPTIONS_MENU_ACTION_DEVICE_INFO) {
 					device_info_open(&device_info);
+				} else if (selected->action == OPTIONS_MENU_ACTION_POWER_OFF) {
+					modal_menu_open(&power_confirm, 0U);
 				} else {
 					options_menu_close(&options_menu);
 				}
@@ -1462,20 +1829,32 @@ int main(void)
 				if (rc != 0) {
 					LOG_ERR("send_encoder_button_click_report failed: %d", rc);
 				}
+			} else {
+				rc = ble_hid_send_key_tap(BLE_HID_USAGE_KEYBOARD_ENTER);
+				if ((rc != 0) && (rc != -ENOTCONN) && (rc != -EAGAIN)) {
+					LOG_ERR("ble_hid_send_key_tap enter failed: %d", rc);
+				}
 			}
 			redraw = true;
 		} else if (event.type == APP_EVENT_MACROPAD_KEYS) {
-			if (device_info.open) {
+			bool overlay_open = local_overlay_open(&options_menu, &device_info,
+				&feedback_menu, &power_confirm);
+
+			if ((ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) &&
+			    device_info.open) {
 				redraw = true;
 				continue;
 			}
+
 			macropad_input_state.keys = event.keys;
-			rc = key_leds_update(macropad_input_state.keys);
-			if (rc != 0) {
+			rc = apply_key_feedback(ui_state.operating_mode, ble_feedback,
+				macropad_input_state.keys);
+			if ((rc != 0) && (rc != -ENOTSUP)) {
 				LOG_WRN("Failed to update macropad LEDs: %d", rc);
 			}
 			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_BLE) {
-				rc = ble_hid_send_key_state(macropad_input_state.keys);
+				rc = ble_hid_send_key_state(overlay_open ? 0U :
+					macropad_input_state.keys);
 				if ((rc != 0) && (rc != -ENOTCONN) && (rc != -EAGAIN)) {
 					LOG_ERR("ble_hid_send_key_state failed: %d", rc);
 				}
@@ -1490,13 +1869,21 @@ int main(void)
 				continue;
 			}
 
-			status_led_pulse(INPUT_ACTIVITY_LED_PULSE_MS);
+			if ((ui_state.operating_mode == MACROPAD_OPERATING_MODE_BLE) &&
+			    ble_feedback_uses_buzzer(ble_feedback) && !overlay_open) {
+				status_buzzer_pulse(FEEDBACK_PREVIEW_MS);
+			} else if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
+				status_led_pulse(INPUT_ACTIVITY_LED_PULSE_MS);
+			}
 			redraw = true;
 		} else if (event.type == APP_EVENT_MACROPAD_CONFIG) {
-			key_leds_apply_config(&event.config);
-			rc = key_leds_update(macropad_input_state.keys);
-			if (rc != 0) {
-				LOG_WRN("Failed to apply macropad config: %d", rc);
+			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
+				key_leds_apply_config(&event.config);
+				rc = apply_key_feedback(ui_state.operating_mode, ble_feedback,
+					macropad_input_state.keys);
+				if ((rc != 0) && (rc != -ENOTSUP)) {
+					LOG_WRN("Failed to apply macropad config: %d", rc);
+				}
 			}
 		} else if (event.type == APP_EVENT_TX_RESULT) {
 			if (handle_tx_result_event(&ui_state, &event, now_ms)) {

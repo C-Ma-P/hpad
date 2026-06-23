@@ -11,6 +11,7 @@ void status_led_pulse(uint32_t pulse_ms);
 
 int status_buzzer_init(void);
 void status_buzzer_set(bool on);
+void status_buzzer_pulse(uint32_t pulse_ms);
 
 bool status_usb_power_present(void);
 int status_power_rails_off(void);

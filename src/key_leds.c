@@ -27,6 +27,21 @@ static uint8_t scale_led_channel(uint8_t value, uint8_t brightness)
 	return (uint8_t)(((uint16_t)value * (uint16_t)brightness + 127U) / 255U);
 }
 
+static uint8_t ble_feedback_brightness(enum macropad_ble_feedback feedback)
+{
+	switch (feedback) {
+	case MACROPAD_BLE_FEEDBACK_LED_LOW:
+		return 24U;
+	case MACROPAD_BLE_FEEDBACK_LED_MED:
+		return 72U;
+	case MACROPAD_BLE_FEEDBACK_LED_HIGH:
+		return 160U;
+	case MACROPAD_BLE_FEEDBACK_BUZZ:
+	default:
+		return 0U;
+	}
+}
+
 int key_leds_update(uint8_t keys)
 {
 #if HAVE_MACROPAD_LED_STRIP
@@ -55,6 +70,43 @@ int key_leds_update(uint8_t keys)
 	ARG_UNUSED(keys);
 	return -ENOTSUP;
 #endif
+}
+
+int key_leds_update_ble_feedback(uint8_t keys, enum macropad_ble_feedback feedback)
+{
+#if HAVE_MACROPAD_LED_STRIP
+	const uint8_t brightness = ble_feedback_brightness(feedback);
+
+	for (size_t index = 0; index < MACROPAD_LED_STRIP_LENGTH; ++index) {
+		struct led_rgb color = { 0 };
+
+		if ((brightness != 0U) && (index < HPAD_PROTOCOL_KEY_COUNT) &&
+		    ((keys & BIT(index)) != 0U)) {
+			color = (struct led_rgb){
+				.r = brightness,
+				.g = brightness,
+				.b = brightness,
+			};
+		}
+
+		macropad_led_strip_pixels[index] = color;
+	}
+
+	return led_strip_update_rgb(macropad_led_strip,
+				    macropad_led_strip_pixels,
+				    MACROPAD_LED_STRIP_LENGTH);
+#else
+	ARG_UNUSED(keys);
+	ARG_UNUSED(feedback);
+	return -ENOTSUP;
+#endif
+}
+
+int key_leds_preview_ble_feedback(enum macropad_ble_feedback feedback)
+{
+	uint8_t brightness = ble_feedback_brightness(feedback);
+
+	return key_leds_set_all(brightness, brightness, brightness);
 }
 
 int key_leds_init(void)
