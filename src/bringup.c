@@ -201,6 +201,8 @@ int bringup_main(void)
 		LOG_WRN("bringup s5: status_display_init FAIL (rc=%d)", rc);
 	} else {
 		const struct status_display_state display_state = {
+			.operating_mode = MACROPAD_OPERATING_MODE_DONGLE,
+			.ble_state = BLE_HID_STATE_INACTIVE,
 			.connected = false,
 			.dongle_activity = false,
 			.usb_power_present = false,

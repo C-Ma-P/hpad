@@ -46,7 +46,8 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define BATTERY_POWEROFF_SUSTAIN_MS 60000
 #define BATTERY_CRITICAL_BLINK_MS 500
 #define ENCODER_LONG_PRESS_MS 700
-#define OPTIONS_MENU_ITEM_COUNT 2U
+#define OPTIONS_MENU_ITEM_COUNT 3U
+#define TRANSIENT_MESSAGE_HOLD_MS 700
 
 static struct k_spinlock input_state_lock;
 
@@ -70,6 +71,7 @@ struct app_event {
 
 struct app_ui_state {
 	enum macropad_operating_mode operating_mode;
+	enum ble_hid_state ble_state;
 	bool connected;
 	bool dongle_activity;
 	bool usb_power_present;
@@ -79,7 +81,8 @@ struct app_ui_state {
 
 enum options_menu_action {
 	OPTIONS_MENU_ACTION_SWITCH_MODE = 0,
-	OPTIONS_MENU_ACTION_CLOSE = 1,
+	OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING = 1,
+	OPTIONS_MENU_ACTION_CLOSE = 2,
 };
 
 struct options_menu_item {
@@ -89,6 +92,7 @@ struct options_menu_item {
 struct options_menu_state {
 	bool open;
 	size_t selected_index;
+	size_t first_visible_index;
 };
 
 struct battery_policy_state {
@@ -116,6 +120,7 @@ static bool encoder_delta_event_pending;
 
 static const struct options_menu_item options_menu_items[OPTIONS_MENU_ITEM_COUNT] = {
 	{ .action = OPTIONS_MENU_ACTION_SWITCH_MODE },
+	{ .action = OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING },
 	{ .action = OPTIONS_MENU_ACTION_CLOSE },
 };
 
@@ -238,19 +243,22 @@ static void options_menu_labels(enum macropad_operating_mode current_mode,
 				const char *labels[OPTIONS_MENU_ITEM_COUNT])
 {
 	labels[0] = mode_menu_label(current_mode);
-	labels[1] = "Close";
+	labels[1] = "Forget Pairing";
+	labels[2] = "Close";
 }
 
 static void options_menu_open(struct options_menu_state *menu)
 {
 	menu->open = true;
 	menu->selected_index = 0U;
+	menu->first_visible_index = 0U;
 }
 
 static void options_menu_close(struct options_menu_state *menu)
 {
 	menu->open = false;
 	menu->selected_index = 0U;
+	menu->first_visible_index = 0U;
 }
 
 static void options_menu_move(struct options_menu_state *menu, int32_t delta)
@@ -262,13 +270,54 @@ static void options_menu_move(struct options_menu_state *menu, int32_t delta)
 	while (delta > 0) {
 		menu->selected_index = (menu->selected_index + 1U) %
 			ARRAY_SIZE(options_menu_items);
+		status_display_menu_clamp_viewport(ARRAY_SIZE(options_menu_items),
+			menu->selected_index, &menu->first_visible_index);
 		delta--;
 	}
 	while (delta < 0) {
 		menu->selected_index = (menu->selected_index == 0U) ?
 			(ARRAY_SIZE(options_menu_items) - 1U) : (menu->selected_index - 1U);
+		status_display_menu_clamp_viewport(ARRAY_SIZE(options_menu_items),
+			menu->selected_index, &menu->first_visible_index);
 		delta++;
 	}
+}
+
+static void show_transient_message(bool display_available, bool *display_sleeping,
+				   const char *line1, const char *line2, int32_t hold_ms)
+{
+	int rc;
+
+	if (!display_available) {
+		return;
+	}
+
+	if ((display_sleeping != NULL) && *display_sleeping) {
+		(void)status_display_unblank();
+		*display_sleeping = false;
+	}
+
+	rc = status_display_render_message(line1, line2);
+	if (rc != 0) {
+		LOG_WRN("Transient display message failed: %d", rc);
+		return;
+	}
+
+	if (hold_ms > 0) {
+		k_msleep(hold_ms);
+	}
+}
+
+static const char *starting_message(enum macropad_operating_mode mode)
+{
+	return (mode == MACROPAD_OPERATING_MODE_BLE) ?
+		"Starting BLE..." : "Starting Dongle...";
+}
+
+static const char *failed_message(enum macropad_operating_mode mode)
+{
+	return (mode == MACROPAD_OPERATING_MODE_BLE) ?
+		"BLE failed" : "Dongle failed";
 }
 
 static int start_dongle_transport(void)
@@ -346,7 +395,8 @@ static int stop_transport(enum macropad_operating_mode mode)
 }
 
 static int switch_operating_mode(struct app_ui_state *ui_state,
-				 enum macropad_operating_mode target_mode)
+				 enum macropad_operating_mode target_mode,
+				 bool display_available, bool *display_sleeping)
 {
 	enum macropad_operating_mode previous_mode;
 	int rc;
@@ -356,6 +406,9 @@ static int switch_operating_mode(struct app_ui_state *ui_state,
 	}
 
 	previous_mode = ui_state->operating_mode;
+	show_transient_message(display_available, display_sleeping,
+		starting_message(target_mode), NULL, 0);
+
 	rc = stop_transport(previous_mode);
 	if (rc != 0) {
 		LOG_WRN("Failed to stop mode %u cleanly: %d", previous_mode, rc);
@@ -365,6 +418,10 @@ static int switch_operating_mode(struct app_ui_state *ui_state,
 	if (rc != 0) {
 		LOG_ERR("Failed to start mode %u: %d", target_mode, rc);
 		(void)start_transport(previous_mode);
+		ui_state->ble_state = ble_hid_get_state();
+		show_transient_message(display_available, display_sleeping,
+			failed_message(target_mode), "Restored old mode",
+			TRANSIENT_MESSAGE_HOLD_MS);
 		return rc;
 	}
 
@@ -374,9 +431,39 @@ static int switch_operating_mode(struct app_ui_state *ui_state,
 	}
 
 	ui_state->operating_mode = target_mode;
+	ui_state->ble_state = ble_hid_get_state();
 	ui_state->connected = false;
 	ui_state->dongle_activity = false;
 	ui_state->last_delivery_success_ms = INT64_MIN;
+	return 0;
+}
+
+static int forget_ble_pairing(struct app_ui_state *ui_state,
+			      bool display_available, bool *display_sleeping)
+{
+	int rc;
+
+	if (ui_state->operating_mode != MACROPAD_OPERATING_MODE_BLE) {
+		show_transient_message(display_available, display_sleeping,
+			"Use BLE mode", "to forget", TRANSIENT_MESSAGE_HOLD_MS);
+		return -EAGAIN;
+	}
+
+	show_transient_message(display_available, display_sleeping,
+		"Forgetting BLE...", NULL, 0);
+
+	rc = ble_hid_forget_pairing();
+	ui_state->ble_state = ble_hid_get_state();
+	ui_state->connected = ble_hid_is_connected();
+	ui_state->dongle_activity = false;
+	if (rc != 0) {
+		show_transient_message(display_available, display_sleeping,
+			"Forget failed", "BLE ERR", TRANSIENT_MESSAGE_HOLD_MS);
+		return rc;
+	}
+
+	show_transient_message(display_available, display_sleeping,
+		"Pairing cleared", "BLE READY", TRANSIENT_MESSAGE_HOLD_MS);
 	return 0;
 }
 
@@ -441,6 +528,7 @@ static struct status_display_state make_display_state(const struct app_ui_state 
 {
 	return (struct status_display_state){
 		.operating_mode = ui_state->operating_mode,
+		.ble_state = ui_state->ble_state,
 		.connected = ui_state->connected,
 		.dongle_activity = ui_state->dongle_activity,
 		.usb_power_present = ui_state->usb_power_present,
@@ -611,6 +699,7 @@ static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 	bool dongle_activity;
 	bool warning_visible;
 	bool connected;
+	enum ble_hid_state ble_state;
 
 	if (state->usb_power_present != usb_power_present) {
 		state->usb_power_present = usb_power_present;
@@ -622,6 +711,11 @@ static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 	}
 
 	if (state->operating_mode == MACROPAD_OPERATING_MODE_BLE) {
+		ble_state = ble_hid_get_state();
+		if (state->ble_state != ble_state) {
+			state->ble_state = ble_state;
+			dirty = true;
+		}
 		connected = ble_hid_is_connected();
 		if (state->connected != connected) {
 			state->connected = connected;
@@ -757,6 +851,7 @@ int main(void)
 	struct app_event event;
 	struct app_ui_state ui_state = {
 		.operating_mode = MACROPAD_OPERATING_MODE_DONGLE,
+		.ble_state = BLE_HID_STATE_INACTIVE,
 		.connected = false,
 		.dongle_activity = false,
 		.usb_power_present = false,
@@ -766,6 +861,7 @@ int main(void)
 	struct options_menu_state options_menu = {
 		.open = false,
 		.selected_index = 0U,
+		.first_visible_index = 0U,
 	};
 	int64_t next_heartbeat_ms = 0;
 	int64_t last_display_update_ms = INT64_MIN;
@@ -859,6 +955,7 @@ int main(void)
 		LOG_ERR("Failed to start saved mode %u: %d", ui_state.operating_mode, rc);
 		return 0;
 	}
+	ui_state.ble_state = ble_hid_get_state();
 
 	LOG_INF("Macropad sender ready in mode %u", ui_state.operating_mode);
 	next_heartbeat_ms = k_uptime_get();
@@ -917,7 +1014,8 @@ int main(void)
 
 				options_menu_labels(ui_state.operating_mode, menu_labels);
 				rc = status_display_render_menu("Options", menu_labels,
-					ARRAY_SIZE(menu_labels), options_menu.selected_index);
+					ARRAY_SIZE(menu_labels), options_menu.selected_index,
+					options_menu.first_visible_index);
 			} else {
 				const struct status_display_state display_state =
 					make_display_state(&ui_state);
@@ -1093,9 +1191,18 @@ int main(void)
 						opposite_mode(ui_state.operating_mode);
 
 					options_menu_close(&options_menu);
-					rc = switch_operating_mode(&ui_state, target_mode);
+					rc = switch_operating_mode(&ui_state, target_mode,
+						display_available, &display_sleeping);
 					if (rc != 0) {
 						LOG_ERR("switch_operating_mode failed: %d", rc);
+					}
+				} else if (selected->action ==
+					   OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING) {
+					options_menu_close(&options_menu);
+					rc = forget_ble_pairing(&ui_state, display_available,
+						&display_sleeping);
+					if (rc != 0) {
+						LOG_ERR("forget_ble_pairing failed: %d", rc);
 					}
 				} else {
 					options_menu_close(&options_menu);

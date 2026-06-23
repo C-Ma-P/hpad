@@ -14,6 +14,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/util.h>
 
 LOG_MODULE_REGISTER(ble_hid, LOG_LEVEL_INF);
@@ -37,6 +38,12 @@ static bool advertising;
 static bool ble_active;
 static bool protocol_boot;
 static uint8_t last_report[INPUT_REP_KEYS_LEN];
+static atomic_t ble_state = ATOMIC_INIT(BLE_HID_STATE_INACTIVE);
+
+static void state_set(enum ble_hid_state state)
+{
+	atomic_set(&ble_state, (atomic_val_t)state);
+}
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE,
@@ -60,20 +67,24 @@ static int advertising_start(void)
 	int rc;
 
 	if (!ble_active || !bt_is_ready()) {
+		state_set(BLE_HID_STATE_ERROR);
 		return -EAGAIN;
 	}
 
 	rc = bt_le_adv_start(adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	if (rc == -EALREADY) {
 		advertising = true;
+		state_set(BLE_HID_STATE_ADVERTISING);
 		return 0;
 	}
 	if (rc != 0) {
 		LOG_WRN("BLE advertising start failed: %d", rc);
+		state_set(BLE_HID_STATE_ERROR);
 		return rc;
 	}
 
 	advertising = true;
+	state_set(BLE_HID_STATE_ADVERTISING);
 	LOG_INF("BLE HID advertising started");
 	return 0;
 }
@@ -105,6 +116,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	if (err != 0U) {
 		LOG_WRN("BLE connection failed: 0x%02x", err);
+		state_set(BLE_HID_STATE_ERROR);
 		(void)advertising_start();
 		return;
 	}
@@ -112,6 +124,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	rc = bt_hids_connected(&hids_obj, conn);
 	if (rc != 0) {
 		LOG_WRN("Failed to notify HIDS about connection: %d", rc);
+		state_set(BLE_HID_STATE_ERROR);
 		(void)bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 		return;
 	}
@@ -124,6 +137,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	active_conn = bt_conn_ref(conn);
 	protocol_boot = false;
 	advertising = false;
+	state_set(BLE_HID_STATE_CONNECTED);
 	LOG_INF("BLE HID connected");
 }
 
@@ -146,6 +160,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 	if (ble_active) {
 		(void)advertising_start();
+	} else {
+		state_set(BLE_HID_STATE_INACTIVE);
 	}
 }
 
@@ -156,9 +172,15 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 
 	if (err != 0) {
 		LOG_WRN("BLE security failed level=%u err=%d", level, err);
+		if (ble_active && (conn == active_conn)) {
+			state_set(BLE_HID_STATE_SECURITY_FAILED);
+		}
 		return;
 	}
 
+	if (ble_active && (conn == active_conn)) {
+		state_set(BLE_HID_STATE_CONNECTED);
+	}
 	LOG_INF("BLE security changed level=%u", level);
 }
 
@@ -239,8 +261,11 @@ int ble_hid_start(void)
 {
 	int rc;
 
+	state_set(BLE_HID_STATE_STARTING);
+
 	rc = hids_init_once();
 	if (rc != 0) {
+		state_set(BLE_HID_STATE_ERROR);
 		return rc;
 	}
 
@@ -251,6 +276,7 @@ int ble_hid_start(void)
 		rc = bt_enable(NULL);
 		if (rc != 0) {
 			ble_active = false;
+			state_set(BLE_HID_STATE_ERROR);
 			LOG_ERR("Bluetooth init failed: %d", rc);
 			return rc;
 		}
@@ -277,6 +303,7 @@ int ble_hid_stop(void)
 {
 	int rc;
 
+	state_set(BLE_HID_STATE_STOPPING);
 	ble_active = false;
 	advertising_stop();
 
@@ -291,16 +318,69 @@ int ble_hid_stop(void)
 	protocol_boot = false;
 
 	if (!bt_is_ready()) {
+		state_set(BLE_HID_STATE_INACTIVE);
 		return 0;
 	}
 
 	rc = bt_disable();
 	if (rc != 0) {
 		LOG_WRN("Bluetooth disable failed: %d", rc);
+		state_set(BLE_HID_STATE_ERROR);
 		return rc;
 	}
 
+	state_set(BLE_HID_STATE_INACTIVE);
 	LOG_INF("BLE HID stopped");
+	return 0;
+}
+
+int ble_hid_forget_pairing(void)
+{
+	bool waiting_for_disconnect = false;
+	int rc;
+
+	if (!ble_active || !bt_is_ready()) {
+		state_set(BLE_HID_STATE_ERROR);
+		return -EAGAIN;
+	}
+
+	advertising_stop();
+
+	if (active_conn != NULL) {
+		int disconnect_rc;
+
+		(void)bt_hids_disconnected(&hids_obj, active_conn);
+		disconnect_rc = bt_conn_disconnect(active_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		if ((disconnect_rc != 0) && (disconnect_rc != -ENOTCONN)) {
+			LOG_WRN("BLE disconnect before unpair failed: %d", disconnect_rc);
+		}
+		waiting_for_disconnect = (disconnect_rc == 0);
+		bt_conn_unref(active_conn);
+		active_conn = NULL;
+	}
+
+	memset(last_report, 0, sizeof(last_report));
+	protocol_boot = false;
+
+	rc = bt_unpair(BT_ID_DEFAULT, NULL);
+	if (rc != 0) {
+		LOG_WRN("BLE unpair failed: %d", rc);
+		state_set(BLE_HID_STATE_ERROR);
+		return rc;
+	}
+
+	if (waiting_for_disconnect) {
+		state_set(BLE_HID_STATE_STARTING);
+		LOG_INF("BLE pairing data cleared; waiting for disconnect");
+		return 0;
+	}
+
+	rc = advertising_start();
+	if (rc != 0) {
+		return rc;
+	}
+
+	LOG_INF("BLE pairing data cleared");
 	return 0;
 }
 
@@ -345,4 +425,9 @@ int ble_hid_send_key_state(uint8_t keys)
 bool ble_hid_is_connected(void)
 {
 	return active_conn != NULL;
+}
+
+enum ble_hid_state ble_hid_get_state(void)
+{
+	return (enum ble_hid_state)atomic_get(&ble_state);
 }

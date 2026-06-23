@@ -1,7 +1,7 @@
 #include "status_display.h"
 
 #include <errno.h>
-#include <stdio.h>
+#include <string.h>
 
 #include <zephyr/device.h>
 #include <zephyr/display/cfb.h>
@@ -13,6 +13,7 @@ LOG_MODULE_REGISTER(status_display, LOG_LEVEL_INF);
 
 #define DISPLAY_NODE DT_CHOSEN(zephyr_display)
 #define DISPLAY_DEFAULT_WIDTH 128U
+#define DISPLAY_DEFAULT_HEIGHT 32U
 #define DISPLAY_MARGIN_X 2U
 #define TOP_ICON_Y 1U
 #define DONGLE_ICON_X 2U
@@ -47,14 +48,22 @@ LOG_MODULE_REGISTER(status_display, LOG_LEVEL_INF);
 #define MODE_LABEL_DONGLE_X 18U
 #define MODE_LABEL_BLE_X 2U
 #define MODE_LABEL_Y 1U
-#define MENU_TITLE_X 0U
+#define COMPACT_GLYPH_WIDTH 5U
+#define COMPACT_GLYPH_HEIGHT 7U
+#define COMPACT_GLYPH_GAP 1U
+#define COMPACT_LINE_HEIGHT (COMPACT_GLYPH_HEIGHT + 2U)
+#define MENU_TITLE_X 2U
 #define MENU_TITLE_Y 0U
-#define MENU_ITEM_X 0U
-#define MENU_FIRST_ITEM_Y 11U
-#define MENU_ITEM_LINE_HEIGHT 10U
+#define MENU_ITEM_X 2U
+#define MENU_MARKER_WIDTH (COMPACT_GLYPH_WIDTH + COMPACT_GLYPH_GAP)
+#define MENU_TITLE_BOTTOM_GAP 3U
+#define MENU_FIRST_ITEM_Y (MENU_TITLE_Y + COMPACT_GLYPH_HEIGHT + MENU_TITLE_BOTTOM_GAP)
+#define MENU_SCROLL_CUE_WIDTH (COMPACT_GLYPH_WIDTH + COMPACT_GLYPH_GAP)
+#define MESSAGE_LINE_GAP 3U
 
 static const struct device *const display = DEVICE_DT_GET(DISPLAY_NODE);
 static uint16_t display_width_px = DISPLAY_DEFAULT_WIDTH;
+static uint16_t display_height_px = DISPLAY_DEFAULT_HEIGHT;
 
 static const uint16_t usb_icon_rows[USB_ICON_HEIGHT] = {
 	0x024U,
@@ -86,6 +95,8 @@ static const uint8_t charge_bolt_rows[CHARGE_BOLT_HEIGHT] = {
 
 static int draw_small_glyph(uint16_t x, uint16_t y, uint8_t width, const uint8_t *rows);
 static int draw_small_text(uint16_t x, uint16_t y, const char *text);
+static int draw_compact_text_clipped(uint16_t x, uint16_t y, const char *text,
+				     uint16_t max_width);
 
 static uint8_t battery_mv_to_pct(uint16_t mv)
 {
@@ -140,6 +151,10 @@ static int draw_pixel(uint16_t x, uint16_t y)
 		.x = x,
 		.y = y,
 	};
+
+	if ((x >= display_width_px) || (y >= display_height_px)) {
+		return 0;
+	}
 
 	return cfb_draw_point(display, &pos);
 }
@@ -371,15 +386,25 @@ static int draw_usb_icon(void)
 	return draw_bitmap(x, TOP_ICON_Y, USB_ICON_WIDTH, USB_ICON_HEIGHT, rows);
 }
 
-static int draw_display_text(uint16_t x, uint16_t y, const char *text)
+static const char *ble_status_text(enum ble_hid_state state)
 {
-	int rc = cfb_print(display, text, x, y);
-
-	if (rc != 0) {
-		LOG_ERR("cfb_print failed: %d", rc);
+	switch (state) {
+	case BLE_HID_STATE_INACTIVE:
+		return "BLE OFF";
+	case BLE_HID_STATE_STARTING:
+		return "BLE START";
+	case BLE_HID_STATE_ADVERTISING:
+		return "BLE READY";
+	case BLE_HID_STATE_CONNECTED:
+		return "BLE LINKED";
+	case BLE_HID_STATE_SECURITY_FAILED:
+	case BLE_HID_STATE_ERROR:
+		return "BLE ERR";
+	case BLE_HID_STATE_STOPPING:
+		return "BLE STOP";
+	default:
+		return "BLE ?";
 	}
-
-	return rc;
 }
 
 static int draw_mode_label(enum macropad_operating_mode mode)
@@ -573,6 +598,331 @@ static int draw_small_glyph(uint16_t x, uint16_t y, uint8_t width, const uint8_t
 	return 0;
 }
 
+static void compact_glyph_rows(char ch, uint8_t rows[COMPACT_GLYPH_HEIGHT])
+{
+	if ((ch >= 'a') && (ch <= 'z')) {
+		ch = (char)(ch - ('a' - 'A'));
+	}
+
+	switch (ch) {
+	case 'A':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x11U, 0x11U, 0x1FU, 0x11U, 0x11U, 0x11U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'B':
+		memcpy(rows, (uint8_t[]){0x1EU, 0x11U, 0x11U, 0x1EU, 0x11U, 0x11U, 0x1EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'C':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x11U, 0x10U, 0x10U, 0x10U, 0x11U, 0x0EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'D':
+		memcpy(rows, (uint8_t[]){0x1EU, 0x11U, 0x11U, 0x11U, 0x11U, 0x11U, 0x1EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'E':
+		memcpy(rows, (uint8_t[]){0x1FU, 0x10U, 0x10U, 0x1EU, 0x10U, 0x10U, 0x1FU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'F':
+		memcpy(rows, (uint8_t[]){0x1FU, 0x10U, 0x10U, 0x1EU, 0x10U, 0x10U, 0x10U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'G':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x11U, 0x10U, 0x17U, 0x11U, 0x11U, 0x0FU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'H':
+		memcpy(rows, (uint8_t[]){0x11U, 0x11U, 0x11U, 0x1FU, 0x11U, 0x11U, 0x11U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'I':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x04U, 0x04U, 0x04U, 0x04U, 0x04U, 0x0EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'J':
+		memcpy(rows, (uint8_t[]){0x01U, 0x01U, 0x01U, 0x01U, 0x11U, 0x11U, 0x0EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'K':
+		memcpy(rows, (uint8_t[]){0x11U, 0x12U, 0x14U, 0x18U, 0x14U, 0x12U, 0x11U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'L':
+		memcpy(rows, (uint8_t[]){0x10U, 0x10U, 0x10U, 0x10U, 0x10U, 0x10U, 0x1FU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'M':
+		memcpy(rows, (uint8_t[]){0x11U, 0x1BU, 0x15U, 0x15U, 0x11U, 0x11U, 0x11U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'N':
+		memcpy(rows, (uint8_t[]){0x11U, 0x19U, 0x15U, 0x13U, 0x11U, 0x11U, 0x11U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'O':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x11U, 0x11U, 0x11U, 0x11U, 0x11U, 0x0EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'P':
+		memcpy(rows, (uint8_t[]){0x1EU, 0x11U, 0x11U, 0x1EU, 0x10U, 0x10U, 0x10U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'Q':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x11U, 0x11U, 0x11U, 0x15U, 0x12U, 0x0DU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'R':
+		memcpy(rows, (uint8_t[]){0x1EU, 0x11U, 0x11U, 0x1EU, 0x14U, 0x12U, 0x11U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'S':
+		memcpy(rows, (uint8_t[]){0x0FU, 0x10U, 0x10U, 0x0EU, 0x01U, 0x01U, 0x1EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'T':
+		memcpy(rows, (uint8_t[]){0x1FU, 0x04U, 0x04U, 0x04U, 0x04U, 0x04U, 0x04U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'U':
+		memcpy(rows, (uint8_t[]){0x11U, 0x11U, 0x11U, 0x11U, 0x11U, 0x11U, 0x0EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'V':
+		memcpy(rows, (uint8_t[]){0x11U, 0x11U, 0x11U, 0x11U, 0x0AU, 0x0AU, 0x04U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'W':
+		memcpy(rows, (uint8_t[]){0x11U, 0x11U, 0x11U, 0x15U, 0x15U, 0x15U, 0x0AU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'X':
+		memcpy(rows, (uint8_t[]){0x11U, 0x11U, 0x0AU, 0x04U, 0x0AU, 0x11U, 0x11U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'Y':
+		memcpy(rows, (uint8_t[]){0x11U, 0x11U, 0x0AU, 0x04U, 0x04U, 0x04U, 0x04U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case 'Z':
+		memcpy(rows, (uint8_t[]){0x1FU, 0x01U, 0x02U, 0x04U, 0x08U, 0x10U, 0x1FU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '0':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x11U, 0x13U, 0x15U, 0x19U, 0x11U, 0x0EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '1':
+		memcpy(rows, (uint8_t[]){0x04U, 0x0CU, 0x04U, 0x04U, 0x04U, 0x04U, 0x0EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '2':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x11U, 0x01U, 0x02U, 0x04U, 0x08U, 0x1FU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '3':
+		memcpy(rows, (uint8_t[]){0x1EU, 0x01U, 0x01U, 0x0EU, 0x01U, 0x01U, 0x1EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '4':
+		memcpy(rows, (uint8_t[]){0x02U, 0x06U, 0x0AU, 0x12U, 0x1FU, 0x02U, 0x02U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '5':
+		memcpy(rows, (uint8_t[]){0x1FU, 0x10U, 0x10U, 0x1EU, 0x01U, 0x01U, 0x1EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '6':
+		memcpy(rows, (uint8_t[]){0x06U, 0x08U, 0x10U, 0x1EU, 0x11U, 0x11U, 0x0EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '7':
+		memcpy(rows, (uint8_t[]){0x1FU, 0x01U, 0x02U, 0x04U, 0x08U, 0x08U, 0x08U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '8':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x11U, 0x11U, 0x0EU, 0x11U, 0x11U, 0x0EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '9':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x11U, 0x11U, 0x0FU, 0x01U, 0x02U, 0x0CU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '>':
+		memcpy(rows, (uint8_t[]){0x10U, 0x08U, 0x04U, 0x02U, 0x04U, 0x08U, 0x10U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '<':
+		memcpy(rows, (uint8_t[]){0x01U, 0x02U, 0x04U, 0x08U, 0x04U, 0x02U, 0x01U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '.':
+		memcpy(rows, (uint8_t[]){0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x0CU, 0x0CU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case ',':
+		memcpy(rows, (uint8_t[]){0x00U, 0x00U, 0x00U, 0x00U, 0x0CU, 0x04U, 0x08U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case ':':
+		memcpy(rows, (uint8_t[]){0x00U, 0x0CU, 0x0CU, 0x00U, 0x0CU, 0x0CU, 0x00U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case ';':
+		memcpy(rows, (uint8_t[]){0x00U, 0x0CU, 0x0CU, 0x00U, 0x0CU, 0x04U, 0x08U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '!':
+		memcpy(rows, (uint8_t[]){0x04U, 0x04U, 0x04U, 0x04U, 0x04U, 0x00U, 0x04U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '?':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x11U, 0x01U, 0x02U, 0x04U, 0x00U, 0x04U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '-':
+		memcpy(rows, (uint8_t[]){0x00U, 0x00U, 0x00U, 0x1FU, 0x00U, 0x00U, 0x00U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '_':
+		memcpy(rows, (uint8_t[]){0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x1FU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '/':
+		memcpy(rows, (uint8_t[]){0x01U, 0x01U, 0x02U, 0x04U, 0x08U, 0x10U, 0x10U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '\\':
+		memcpy(rows, (uint8_t[]){0x10U, 0x10U, 0x08U, 0x04U, 0x02U, 0x01U, 0x01U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '+':
+		memcpy(rows, (uint8_t[]){0x00U, 0x04U, 0x04U, 0x1FU, 0x04U, 0x04U, 0x00U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '*':
+		memcpy(rows, (uint8_t[]){0x00U, 0x15U, 0x0EU, 0x1FU, 0x0EU, 0x15U, 0x00U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '(':
+		memcpy(rows, (uint8_t[]){0x02U, 0x04U, 0x08U, 0x08U, 0x08U, 0x04U, 0x02U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case ')':
+		memcpy(rows, (uint8_t[]){0x08U, 0x04U, 0x02U, 0x02U, 0x02U, 0x04U, 0x08U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '[':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x08U, 0x08U, 0x08U, 0x08U, 0x08U, 0x0EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case ']':
+		memcpy(rows, (uint8_t[]){0x0EU, 0x02U, 0x02U, 0x02U, 0x02U, 0x02U, 0x0EU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '\'':
+		memcpy(rows, (uint8_t[]){0x04U, 0x04U, 0x08U, 0x00U, 0x00U, 0x00U, 0x00U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '"':
+		memcpy(rows, (uint8_t[]){0x0AU, 0x0AU, 0x0AU, 0x00U, 0x00U, 0x00U, 0x00U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '%':
+		memcpy(rows, (uint8_t[]){0x18U, 0x19U, 0x02U, 0x04U, 0x08U, 0x13U, 0x03U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '#':
+		memcpy(rows, (uint8_t[]){0x0AU, 0x0AU, 0x1FU, 0x0AU, 0x1FU, 0x0AU, 0x0AU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '&':
+		memcpy(rows, (uint8_t[]){0x0CU, 0x12U, 0x14U, 0x08U, 0x15U, 0x12U, 0x0DU}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case '=':
+		memcpy(rows, (uint8_t[]){0x00U, 0x00U, 0x1FU, 0x00U, 0x1FU, 0x00U, 0x00U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	case ' ':
+		memset(rows, 0, COMPACT_GLYPH_HEIGHT);
+		break;
+	default:
+		memcpy(rows, (uint8_t[]){0x0EU, 0x11U, 0x01U, 0x02U, 0x04U, 0x00U, 0x04U}, COMPACT_GLYPH_HEIGHT);
+		break;
+	}
+}
+
+static uint16_t compact_char_advance(void)
+{
+	return COMPACT_GLYPH_WIDTH + COMPACT_GLYPH_GAP;
+}
+
+static uint16_t compact_text_width_chars(size_t char_count)
+{
+	if (char_count == 0U) {
+		return 0U;
+	}
+
+	return (uint16_t)(char_count * compact_char_advance() - COMPACT_GLYPH_GAP);
+}
+
+static uint16_t compact_text_width(const char *text)
+{
+	return compact_text_width_chars(strlen(text));
+}
+
+static size_t compact_text_capacity(uint16_t max_width)
+{
+	const uint16_t advance = compact_char_advance();
+
+	if (max_width < COMPACT_GLYPH_WIDTH) {
+		return 0U;
+	}
+
+	return (size_t)((max_width + COMPACT_GLYPH_GAP) / advance);
+}
+
+static int draw_compact_glyph(uint16_t x, uint16_t y, char ch)
+{
+	uint8_t rows[COMPACT_GLYPH_HEIGHT];
+
+	compact_glyph_rows(ch, rows);
+	for (uint8_t row = 0U; row < COMPACT_GLYPH_HEIGHT; ++row) {
+		for (uint8_t col = 0U; col < COMPACT_GLYPH_WIDTH; ++col) {
+			int rc;
+
+			if (((rows[row] >> (COMPACT_GLYPH_WIDTH - 1U - col)) & 0x1U) == 0U) {
+				continue;
+			}
+
+			rc = draw_pixel(x + col, y + row);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int draw_compact_text_count(uint16_t x, uint16_t y, const char *text, size_t count)
+{
+	for (size_t index = 0U; index < count; ++index) {
+		int rc = draw_compact_glyph(x, y, text[index]);
+
+		if (rc != 0) {
+			return rc;
+		}
+		x += compact_char_advance();
+	}
+
+	return 0;
+}
+
+static int draw_compact_text_clipped(uint16_t x, uint16_t y, const char *text,
+				     uint16_t max_width)
+{
+	const size_t text_len = strlen(text);
+	const size_t capacity = compact_text_capacity(max_width);
+	size_t visible_count;
+	int rc;
+
+	if (capacity == 0U) {
+		return 0;
+	}
+
+	if (text_len <= capacity) {
+		return draw_compact_text_count(x, y, text, text_len);
+	}
+
+	if (capacity <= 3U) {
+		return draw_compact_text_count(x, y, "...", capacity);
+	}
+
+	visible_count = capacity - 3U;
+	rc = draw_compact_text_count(x, y, text, visible_count);
+	if (rc != 0) {
+		return rc;
+	}
+
+	return draw_compact_text_count(x + (uint16_t)(visible_count * compact_char_advance()),
+		y, "...", 3U);
+}
+
+static int draw_scroll_cue(uint16_t y, bool up)
+{
+	uint8_t rows[COMPACT_GLYPH_HEIGHT];
+	uint16_t x = (display_width_px > (MENU_SCROLL_CUE_WIDTH + DISPLAY_MARGIN_X)) ?
+		(uint16_t)(display_width_px - MENU_SCROLL_CUE_WIDTH - DISPLAY_MARGIN_X) : 0U;
+
+	if (up) {
+		memcpy(rows, (uint8_t[]){0x04U, 0x0EU, 0x15U, 0x04U, 0x04U, 0x04U, 0x00U},
+			COMPACT_GLYPH_HEIGHT);
+	} else {
+		memcpy(rows, (uint8_t[]){0x00U, 0x04U, 0x04U, 0x04U, 0x15U, 0x0EU, 0x04U},
+			COMPACT_GLYPH_HEIGHT);
+	}
+
+	for (uint8_t row = 0U; row < COMPACT_GLYPH_HEIGHT; ++row) {
+		for (uint8_t col = 0U; col < COMPACT_GLYPH_WIDTH; ++col) {
+			int rc;
+
+			if (((rows[row] >> (COMPACT_GLYPH_WIDTH - 1U - col)) & 0x1U) == 0U) {
+				continue;
+			}
+
+			rc = draw_pixel(x + col, y + row);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+	}
+
+	return 0;
+}
+
 static int draw_small_percent(uint16_t x, uint16_t y, uint8_t pct)
 {
 	uint8_t digits[3];
@@ -715,6 +1065,11 @@ int status_display_init(void)
 		display_width_px = (uint16_t)value;
 	}
 
+	value = cfb_get_display_parameter(display, CFB_DISPLAY_HEIGHT);
+	if (value > 0) {
+		display_height_px = (uint16_t)value;
+	}
+
 	return 0;
 }
 
@@ -738,12 +1093,20 @@ int status_display_render(const struct status_display_state *state)
 			LOG_ERR("draw dongle icon failed: %d", rc);
 			return rc;
 		}
-	}
-
-	rc = draw_mode_label(state->operating_mode);
-	if (rc != 0) {
-		LOG_ERR("draw mode label failed: %d", rc);
-		return rc;
+		rc = draw_mode_label(state->operating_mode);
+		if (rc != 0) {
+			LOG_ERR("draw mode label failed: %d", rc);
+			return rc;
+		}
+	} else {
+		rc = draw_compact_text_clipped(MODE_LABEL_BLE_X, MODE_LABEL_Y,
+			ble_status_text(state->ble_state),
+			(display_width_px > MODE_LABEL_BLE_X) ?
+				(uint16_t)(display_width_px - MODE_LABEL_BLE_X) : 0U);
+		if (rc != 0) {
+			LOG_ERR("draw BLE status label failed: %d", rc);
+			return rc;
+		}
 	}
 
 	rc = draw_key_matrix(state->keys_pressed);
@@ -782,13 +1145,130 @@ int status_display_render(const struct status_display_state *state)
 	return rc;
 }
 
-int status_display_render_menu(const char *title, const char *const *items,
-			       size_t item_count, size_t selected_index)
+size_t status_display_menu_visible_rows(void)
 {
+	if (display_height_px <= MENU_FIRST_ITEM_Y) {
+		return 1U;
+	}
+
+	return MAX(1U, (size_t)((display_height_px - MENU_FIRST_ITEM_Y) / COMPACT_LINE_HEIGHT));
+}
+
+void status_display_menu_clamp_viewport(size_t item_count, size_t selected_index,
+					size_t *first_visible_index)
+{
+	size_t visible_rows;
+	size_t max_first;
+
+	if ((first_visible_index == NULL) || (item_count == 0U)) {
+		return;
+	}
+
+	visible_rows = status_display_menu_visible_rows();
+	if (visible_rows >= item_count) {
+		*first_visible_index = 0U;
+		return;
+	}
+
+	max_first = item_count - visible_rows;
+	if (*first_visible_index > max_first) {
+		*first_visible_index = max_first;
+	}
+	if (selected_index < *first_visible_index) {
+		*first_visible_index = selected_index;
+	} else if (selected_index >= (*first_visible_index + visible_rows)) {
+		*first_visible_index = selected_index - visible_rows + 1U;
+	}
+}
+
+int status_display_render_menu(const char *title, const char *const *items,
+			       size_t item_count, size_t selected_index,
+			       size_t first_visible_index)
+{
+	size_t visible_rows;
+	size_t last_visible_index;
 	int rc;
 
 	if ((title == NULL) || ((items == NULL) && (item_count != 0U)) ||
 	    ((item_count != 0U) && (selected_index >= item_count))) {
+		return -EINVAL;
+	}
+
+	status_display_menu_clamp_viewport(item_count, selected_index, &first_visible_index);
+	visible_rows = status_display_menu_visible_rows();
+	last_visible_index = MIN(item_count, first_visible_index + visible_rows);
+
+	rc = cfb_framebuffer_clear(display, false);
+	if (rc != 0) {
+		LOG_ERR("cfb_framebuffer_clear failed: %d", rc);
+		return rc;
+	}
+
+	rc = draw_compact_text_clipped(MENU_TITLE_X, MENU_TITLE_Y, title,
+		(display_width_px > MENU_TITLE_X) ?
+			(uint16_t)(display_width_px - MENU_TITLE_X) : 0U);
+	if (rc != 0) {
+		return rc;
+	}
+
+	if (first_visible_index > 0U) {
+		rc = draw_scroll_cue(MENU_TITLE_Y, true);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+	if (last_visible_index < item_count) {
+		rc = draw_scroll_cue((uint16_t)(MENU_FIRST_ITEM_Y +
+			((visible_rows - 1U) * COMPACT_LINE_HEIGHT)), false);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	for (size_t index = first_visible_index; index < last_visible_index; ++index) {
+		uint16_t y = MENU_FIRST_ITEM_Y +
+			(uint16_t)((index - first_visible_index) * COMPACT_LINE_HEIGHT);
+		const bool selected = (index == selected_index);
+
+		rc = draw_compact_glyph(MENU_ITEM_X, y, selected ? '>' : ' ');
+		if (rc != 0) {
+			return rc;
+		}
+
+		rc = draw_compact_text_clipped(MENU_ITEM_X + MENU_MARKER_WIDTH, y,
+			items[index],
+			(display_width_px > (MENU_ITEM_X + MENU_MARKER_WIDTH +
+					     MENU_SCROLL_CUE_WIDTH + DISPLAY_MARGIN_X)) ?
+				(uint16_t)(display_width_px - MENU_ITEM_X -
+					MENU_MARKER_WIDTH - MENU_SCROLL_CUE_WIDTH -
+					DISPLAY_MARGIN_X) : 0U);
+		if (rc != 0) {
+			return rc;
+		}
+
+		if (selected) {
+			rc = cfb_invert_area(display, 0U, y,
+				display_width_px, COMPACT_LINE_HEIGHT);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+	}
+
+	rc = cfb_framebuffer_finalize(display);
+	if (rc != 0) {
+		LOG_ERR("cfb_framebuffer_finalize failed: %d", rc);
+	}
+
+	return rc;
+}
+
+int status_display_render_message(const char *line1, const char *line2)
+{
+	uint16_t y;
+	int rc;
+
+	if (line1 == NULL) {
 		return -EINVAL;
 	}
 
@@ -798,21 +1278,33 @@ int status_display_render_menu(const char *title, const char *const *items,
 		return rc;
 	}
 
-	rc = draw_display_text(MENU_TITLE_X, MENU_TITLE_Y, title);
-	if (rc != 0) {
-		return rc;
+	if (line2 == NULL) {
+		y = (display_height_px > COMPACT_GLYPH_HEIGHT) ?
+			(uint16_t)((display_height_px - COMPACT_GLYPH_HEIGHT) / 2U) : 0U;
+	} else {
+		const uint16_t block_height = (COMPACT_GLYPH_HEIGHT * 2U) + MESSAGE_LINE_GAP;
+
+		y = (display_height_px > block_height) ?
+			(uint16_t)((display_height_px - block_height) / 2U) : 0U;
 	}
 
-	for (size_t index = 0U; index < item_count; ++index) {
-		char line[18];
-		uint16_t y = MENU_FIRST_ITEM_Y + (uint16_t)(index * MENU_ITEM_LINE_HEIGHT);
+	for (uint8_t line = 0U; line < 2U; ++line) {
+		const char *text = (line == 0U) ? line1 : line2;
+		uint16_t width;
+		uint16_t x;
 
-		(void)snprintf(line, sizeof(line), "%c %s",
-			(index == selected_index) ? '>' : ' ', items[index]);
-		rc = draw_display_text(MENU_ITEM_X, y, line);
+		if (text == NULL) {
+			break;
+		}
+
+		width = compact_text_width(text);
+		x = (display_width_px > width) ? (uint16_t)((display_width_px - width) / 2U) : 0U;
+		rc = draw_compact_text_clipped(x, y, text, display_width_px);
 		if (rc != 0) {
 			return rc;
 		}
+
+		y += COMPACT_GLYPH_HEIGHT + MESSAGE_LINE_GAP;
 	}
 
 	rc = cfb_framebuffer_finalize(display);
