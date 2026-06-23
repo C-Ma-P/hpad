@@ -5,8 +5,26 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(hpadv2)
 
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+set(HPAD_GENERATED_MAIN "${CMAKE_CURRENT_BINARY_DIR}/generated/main.c")
+execute_process(
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_dfu_menu_main.py
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/main.c
+    ${HPAD_GENERATED_MAIN}
+  RESULT_VARIABLE HPAD_DFU_PATCH_RESULT
+)
+if(NOT HPAD_DFU_PATCH_RESULT EQUAL 0)
+  message(FATAL_ERROR "Failed to generate menu-integrated DFU main.c")
+endif()
+
 FILE(GLOB app_sources src/*.c)
-target_sources(app PRIVATE ${app_sources})
+list(REMOVE_ITEM app_sources
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/adafruit_dfu_entry.c"
+)
+target_sources(app PRIVATE ${app_sources} ${HPAD_GENERATED_MAIN})
 
 find_package(Git QUIET)
 
