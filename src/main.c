@@ -140,6 +140,7 @@ struct macropad_input_state {
 	uint16_t battery_mv;
 	uint8_t usb_power_present;
 };
+int a = 0; 
 
 K_MSGQ_DEFINE(app_event_queue, sizeof(struct app_event), APP_EVENT_QUEUE_LEN, 4);
 
