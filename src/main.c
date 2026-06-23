@@ -15,6 +15,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/poweroff.h>
+#include <zephyr/sys/reboot.h>
 
 #include <hal/nrf_power.h>
 
@@ -53,8 +54,9 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define BATTERY_POWEROFF_SUSTAIN_MS 60000
 #define BATTERY_CRITICAL_BLINK_MS 500
 #define ENCODER_LONG_PRESS_MS 700
-#define OPTIONS_MENU_MAX_ITEM_COUNT 6U
+#define OPTIONS_MENU_MAX_ITEM_COUNT 7U
 #define POWER_CONFIRM_ITEM_COUNT 2U
+#define DFU_CONFIRM_ITEM_COUNT 2U
 #define FEEDBACK_ITEM_COUNT 4U
 #define DEVICE_INFO_LINE_COUNT 5U
 #define DEVICE_INFO_LINE_MAX_LEN 64U
@@ -98,8 +100,9 @@ enum options_menu_action {
 	OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING = 1,
 	OPTIONS_MENU_ACTION_FEEDBACK = 2,
 	OPTIONS_MENU_ACTION_DEVICE_INFO = 3,
-	OPTIONS_MENU_ACTION_POWER_OFF = 4,
-	OPTIONS_MENU_ACTION_CLOSE = 5,
+	OPTIONS_MENU_ACTION_WIRELESS_FLASH = 4,
+	OPTIONS_MENU_ACTION_POWER_OFF = 5,
+	OPTIONS_MENU_ACTION_CLOSE = 6,
 };
 
 struct options_menu_item {
@@ -155,6 +158,7 @@ static bool encoder_delta_event_pending;
 static const struct options_menu_item options_menu_dongle_items[] = {
 	{ .action = OPTIONS_MENU_ACTION_SWITCH_MODE },
 	{ .action = OPTIONS_MENU_ACTION_DEVICE_INFO },
+	{ .action = OPTIONS_MENU_ACTION_WIRELESS_FLASH },
 	{ .action = OPTIONS_MENU_ACTION_POWER_OFF },
 	{ .action = OPTIONS_MENU_ACTION_CLOSE },
 };
@@ -164,11 +168,17 @@ static const struct options_menu_item options_menu_ble_items[] = {
 	{ .action = OPTIONS_MENU_ACTION_FEEDBACK },
 	{ .action = OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING },
 	{ .action = OPTIONS_MENU_ACTION_DEVICE_INFO },
+	{ .action = OPTIONS_MENU_ACTION_WIRELESS_FLASH },
 	{ .action = OPTIONS_MENU_ACTION_POWER_OFF },
 	{ .action = OPTIONS_MENU_ACTION_CLOSE },
 };
 
 static const char *const power_confirm_labels[POWER_CONFIRM_ITEM_COUNT] = {
+	"Cancel",
+	"Confirm",
+};
+
+static const char *const dfu_confirm_labels[DFU_CONFIRM_ITEM_COUNT] = {
 	"Cancel",
 	"Confirm",
 };
@@ -387,6 +397,8 @@ static const char *options_menu_action_label(enum options_menu_action action,
 		return "Feedback";
 	case OPTIONS_MENU_ACTION_DEVICE_INFO:
 		return "Device Info";
+	case OPTIONS_MENU_ACTION_WIRELESS_FLASH:
+		return "Wireless Flash";
 	case OPTIONS_MENU_ACTION_POWER_OFF:
 		return "Power Off";
 	case OPTIONS_MENU_ACTION_CLOSE:
@@ -594,10 +606,12 @@ static size_t feedback_index(enum macropad_ble_feedback feedback)
 static bool local_overlay_open(const struct options_menu_state *options_menu,
 			       const struct device_info_state *device_info,
 			       const struct modal_menu_state *feedback_menu,
-			       const struct modal_menu_state *power_confirm)
+			       const struct modal_menu_state *power_confirm,
+			       const struct modal_menu_state *dfu_confirm)
 {
 	return options_menu->open || device_info->open ||
-		feedback_menu->open || power_confirm->open;
+		feedback_menu->open || power_confirm->open ||
+		dfu_confirm->open;
 }
 
 static bool ble_feedback_uses_buzzer(enum macropad_ble_feedback feedback)
@@ -958,6 +972,32 @@ static void perform_user_poweroff(enum macropad_operating_mode mode,
 
 	prepare_for_poweroff(display_available);
 	enter_system_off();
+}
+
+static void perform_wireless_flash(enum macropad_operating_mode mode,
+				   bool display_available,
+				   bool *display_sleeping)
+{
+	int rc;
+
+	show_transient_message(display_available, display_sleeping,
+		"Starting DFU", "BLE update mode", 0);
+
+	rc = stop_transport(mode);
+	if (rc != 0) {
+		LOG_WRN("Failed to stop active transport before DFU handoff: %d", rc);
+	}
+
+	status_buzzer_set(false);
+	status_led_set(false);
+
+	rc = key_leds_set_all(0U, 0U, 0U);
+	if ((rc != 0) && (rc != -ENOTSUP)) {
+		LOG_WRN("Failed to clear key LEDs before DFU handoff: %d", rc);
+	}
+
+	NRF_POWER->GPREGRET = 0xA8U;
+	sys_reboot(SYS_REBOOT_COLD);
 }
 
 static void enforce_battery_policy(bool usb_power_present,
@@ -1337,6 +1377,11 @@ int main(void)
 		.selected_index = 0U,
 		.first_visible_index = 0U,
 	};
+	struct modal_menu_state dfu_confirm = {
+		.open = false,
+		.selected_index = 0U,
+		.first_visible_index = 0U,
+	};
 	int64_t next_heartbeat_ms = 0;
 	int64_t last_display_update_ms = INT64_MIN;
 	int64_t last_activity_ms = 0;
@@ -1459,7 +1504,10 @@ int main(void)
 
 		if (encoder_button_down && !encoder_long_press_consumed &&
 		    ((now_ms - encoder_button_down_ms) >= ENCODER_LONG_PRESS_MS)) {
-			if (power_confirm.open) {
+			if (dfu_confirm.open) {
+				modal_menu_close(&dfu_confirm);
+				options_menu_close(&options_menu);
+			} else if (power_confirm.open) {
 				modal_menu_close(&power_confirm);
 				options_menu_close(&options_menu);
 			} else if (feedback_menu.open) {
@@ -1497,7 +1545,12 @@ int main(void)
 
 		if (display_available && !display_sleeping && redraw && ((last_display_update_ms == INT64_MIN) ||
 			      ((now_ms - last_display_update_ms) >= STATUS_DISPLAY_REFRESH_INTERVAL_MS))) {
-			if (power_confirm.open) {
+			if (dfu_confirm.open) {
+				modal_menu_move(&dfu_confirm, DFU_CONFIRM_ITEM_COUNT, 0);
+				rc = status_display_render_menu("Wireless Flash?", dfu_confirm_labels,
+					DFU_CONFIRM_ITEM_COUNT, dfu_confirm.selected_index,
+					dfu_confirm.first_visible_index);
+			} else if (power_confirm.open) {
 				modal_menu_move(&power_confirm, POWER_CONFIRM_ITEM_COUNT, 0);
 				rc = status_display_render_menu("Power Off?", power_confirm_labels,
 					POWER_CONFIRM_ITEM_COUNT, power_confirm.selected_index,
@@ -1652,6 +1705,13 @@ int main(void)
 				continue;
 			}
 
+			if (dfu_confirm.open) {
+				modal_menu_move(&dfu_confirm, DFU_CONFIRM_ITEM_COUNT,
+					encoder_delta);
+				redraw = true;
+				continue;
+			}
+
 			if (power_confirm.open) {
 				modal_menu_move(&power_confirm, POWER_CONFIRM_ITEM_COUNT,
 					encoder_delta);
@@ -1729,6 +1789,19 @@ int main(void)
 			encoder_button_down_ms = INT64_MIN;
 			if (encoder_long_press_consumed) {
 				encoder_long_press_consumed = false;
+				continue;
+			}
+
+			if (dfu_confirm.open) {
+				bool confirmed = (dfu_confirm.selected_index == 1U);
+
+				modal_menu_close(&dfu_confirm);
+				if (confirmed) {
+					options_menu_close(&options_menu);
+					perform_wireless_flash(ui_state.operating_mode,
+						display_available, &display_sleeping);
+				}
+				redraw = true;
 				continue;
 			}
 
@@ -1816,6 +1889,9 @@ int main(void)
 					preview_ble_feedback(ble_feedback);
 				} else if (selected->action == OPTIONS_MENU_ACTION_DEVICE_INFO) {
 					device_info_open(&device_info);
+				} else if (selected->action ==
+					   OPTIONS_MENU_ACTION_WIRELESS_FLASH) {
+					modal_menu_open(&dfu_confirm, 0U);
 				} else if (selected->action == OPTIONS_MENU_ACTION_POWER_OFF) {
 					modal_menu_open(&power_confirm, 0U);
 				} else {
@@ -1839,7 +1915,7 @@ int main(void)
 			redraw = true;
 		} else if (event.type == APP_EVENT_MACROPAD_KEYS) {
 			bool overlay_open = local_overlay_open(&options_menu, &device_info,
-				&feedback_menu, &power_confirm);
+				&feedback_menu, &power_confirm, &dfu_confirm);
 
 			if ((ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) &&
 			    device_info.open) {
