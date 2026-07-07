@@ -17,6 +17,7 @@ struct status_display_state {
 	bool dongle_activity;
 	bool usb_power_present;
 	bool show_battery_warning;
+	bool keys_locked;
 	uint16_t battery_mv;
 	uint8_t keys_pressed;
 };

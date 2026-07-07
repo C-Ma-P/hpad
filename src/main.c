@@ -14,6 +14,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/logging/log_ctrl.h>
 #include <zephyr/sys/poweroff.h>
 #include <zephyr/sys/reboot.h>
 
@@ -54,7 +55,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define BATTERY_POWEROFF_SUSTAIN_MS 60000
 #define BATTERY_CRITICAL_BLINK_MS 500
 #define ENCODER_LONG_PRESS_MS 700
-#define OPTIONS_MENU_MAX_ITEM_COUNT 7U
+#define OPTIONS_MENU_MAX_ITEM_COUNT 8U
 #define POWER_CONFIRM_ITEM_COUNT 2U
 #define DFU_CONFIRM_ITEM_COUNT 2U
 #define FEEDBACK_ITEM_COUNT 4U
@@ -64,6 +65,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define FEEDBACK_PREVIEW_MS 80
 #define POWEROFF_RELEASE_WAIT_MS 10
 #define WAKE_HOLD_POLL_MS 10
+#define ADAFRUIT_DFU_MAGIC_OTA_RESET 0xA8U
 
 static struct k_spinlock input_state_lock;
 
@@ -92,6 +94,7 @@ struct app_ui_state {
 	bool dongle_activity;
 	bool usb_power_present;
 	bool battery_warning_visible;
+	bool keys_locked;
 	int64_t last_delivery_success_ms;
 };
 
@@ -102,7 +105,8 @@ enum options_menu_action {
 	OPTIONS_MENU_ACTION_DEVICE_INFO = 3,
 	OPTIONS_MENU_ACTION_WIRELESS_FLASH = 4,
 	OPTIONS_MENU_ACTION_POWER_OFF = 5,
-	OPTIONS_MENU_ACTION_CLOSE = 6,
+	OPTIONS_MENU_ACTION_LOCK_KEYS = 6,
+	OPTIONS_MENU_ACTION_CLOSE = 7,
 };
 
 struct options_menu_item {
@@ -160,6 +164,7 @@ static const struct options_menu_item options_menu_dongle_items[] = {
 	{ .action = OPTIONS_MENU_ACTION_DEVICE_INFO },
 	{ .action = OPTIONS_MENU_ACTION_WIRELESS_FLASH },
 	{ .action = OPTIONS_MENU_ACTION_POWER_OFF },
+	{ .action = OPTIONS_MENU_ACTION_LOCK_KEYS },
 	{ .action = OPTIONS_MENU_ACTION_CLOSE },
 };
 
@@ -170,6 +175,7 @@ static const struct options_menu_item options_menu_ble_items[] = {
 	{ .action = OPTIONS_MENU_ACTION_DEVICE_INFO },
 	{ .action = OPTIONS_MENU_ACTION_WIRELESS_FLASH },
 	{ .action = OPTIONS_MENU_ACTION_POWER_OFF },
+	{ .action = OPTIONS_MENU_ACTION_LOCK_KEYS },
 	{ .action = OPTIONS_MENU_ACTION_CLOSE },
 };
 
@@ -204,13 +210,13 @@ static int app_queue_event(const struct app_event *event)
 	return rc;
 }
 
-static void update_battery_filter(uint16_t battery_mv)
+static void update_battery_filter(uint16_t battery_mv, bool reset_filter)
 {
 	if (battery_mv == 0U) {
 		return;
 	}
 
-	if (battery_policy_state.filtered_mv == 0U) {
+	if (reset_filter || (battery_policy_state.filtered_mv == 0U)) {
 		battery_policy_state.filtered_mv = battery_mv;
 		return;
 	}
@@ -219,9 +225,10 @@ static void update_battery_filter(uint16_t battery_mv)
 		(((uint32_t)battery_policy_state.filtered_mv * 3U + battery_mv + 2U) / 4U);
 }
 
-static void update_battery_policy(uint16_t battery_mv, bool usb_power_present, int64_t now_ms)
+static void update_battery_policy(uint16_t battery_mv, bool usb_power_present, int64_t now_ms,
+				  bool reset_filter)
 {
-	update_battery_filter(battery_mv);
+	update_battery_filter(battery_mv, reset_filter);
 
 	if (usb_power_present || (battery_policy_state.filtered_mv == 0U)) {
 		battery_policy_state.below_poweroff_since_ms = INT64_MIN;
@@ -237,14 +244,19 @@ static void update_battery_policy(uint16_t battery_mv, bool usb_power_present, i
 	}
 }
 
-static void refresh_battery_state(struct macropad_input_state *state)
+static void update_battery_state(struct macropad_input_state *state, bool usb_power_present,
+				 bool reset_filter)
 {
-	const bool usb_power_present = status_usb_power_present();
 	const int64_t now_ms = k_uptime_get();
 
 	state->battery_mv = battery_sample_mv();
 	state->usb_power_present = usb_power_present ? 1U : 0U;
-	update_battery_policy(state->battery_mv, usb_power_present, now_ms);
+	update_battery_policy(state->battery_mv, usb_power_present, now_ms, reset_filter);
+}
+
+static void refresh_battery_state(struct macropad_input_state *state, bool reset_filter)
+{
+	update_battery_state(state, status_usb_power_present(), reset_filter);
 }
 
 static bool battery_warning_active(bool usb_power_present)
@@ -386,7 +398,8 @@ options_menu_items_for_mode(enum macropad_operating_mode current_mode,
 }
 
 static const char *options_menu_action_label(enum options_menu_action action,
-					     enum macropad_operating_mode current_mode)
+					     enum macropad_operating_mode current_mode,
+					     bool keys_locked)
 {
 	switch (action) {
 	case OPTIONS_MENU_ACTION_SWITCH_MODE:
@@ -401,6 +414,8 @@ static const char *options_menu_action_label(enum options_menu_action action,
 		return "Wireless Flash";
 	case OPTIONS_MENU_ACTION_POWER_OFF:
 		return "Power Off";
+	case OPTIONS_MENU_ACTION_LOCK_KEYS:
+		return keys_locked ? "Unlock Keys" : "Lock Keys";
 	case OPTIONS_MENU_ACTION_CLOSE:
 	default:
 		return "Close";
@@ -408,6 +423,7 @@ static const char *options_menu_action_label(enum options_menu_action action,
 }
 
 static size_t options_menu_labels(enum macropad_operating_mode current_mode,
+				  bool keys_locked,
 				  const char *labels[OPTIONS_MENU_MAX_ITEM_COUNT])
 {
 	const struct options_menu_item *items;
@@ -415,7 +431,8 @@ static size_t options_menu_labels(enum macropad_operating_mode current_mode,
 
 	items = options_menu_items_for_mode(current_mode, &item_count);
 	for (size_t index = 0U; index < item_count; ++index) {
-		labels[index] = options_menu_action_label(items[index].action, current_mode);
+		labels[index] = options_menu_action_label(items[index].action,
+			current_mode, keys_locked);
 	}
 
 	return item_count;
@@ -839,6 +856,14 @@ static int save_runtime_state(void)
 	return 0;
 }
 
+static void log_boot_reset_state(void)
+{
+	uint32_t reset_reasons = nrf_power_resetreas_get(NRF_POWER);
+
+	LOG_INF("boot reset state: RESETREAS=0x%08x GPREGRET=0x%02x",
+		reset_reasons, NRF_POWER->GPREGRET);
+}
+
 static bool booted_from_system_off(void)
 {
 	uint32_t reset_reasons = nrf_power_resetreas_get(NRF_POWER);
@@ -996,7 +1021,11 @@ static void perform_wireless_flash(enum macropad_operating_mode mode,
 		LOG_WRN("Failed to clear key LEDs before DFU handoff: %d", rc);
 	}
 
-	NRF_POWER->GPREGRET = 0xA8U;
+	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_OTA_RESET;
+	LOG_INF("DFU handoff: GPREGRET=0x%02x, rebooting into Adafruit OTA bootloader",
+		NRF_POWER->GPREGRET);
+	LOG_PANIC();
+	k_msleep(50);
 	sys_reboot(SYS_REBOOT_COLD);
 }
 
@@ -1031,6 +1060,7 @@ static struct status_display_state make_display_state(const struct app_ui_state 
 		.dongle_activity = ui_state->dongle_activity,
 		.usb_power_present = ui_state->usb_power_present,
 		.show_battery_warning = ui_state->battery_warning_visible,
+		.keys_locked = ui_state->keys_locked,
 		.battery_mv = battery_display_mv(),
 		.keys_pressed = macropad_input_state.keys,
 	};
@@ -1040,7 +1070,7 @@ static int macropad_send_report(void)
 {
 	macropad_report_t report;
 
-	refresh_battery_state(&macropad_input_state);
+	refresh_battery_state(&macropad_input_state, false);
 	report = (macropad_report_t){
 		.keys = macropad_input_state.keys,
 		.encoder_delta = macropad_input_state.encoder_delta,
@@ -1060,11 +1090,32 @@ static int macropad_send_heartbeat(void)
 		.encoder_pressed = 0U,
 	};
 
-	refresh_battery_state(&macropad_input_state);
+	refresh_battery_state(&macropad_input_state, false);
 	report.battery_mv = macropad_input_state.battery_mv;
 	report.usb_power_present = macropad_input_state.usb_power_present;
 
 	return radio_esb_send_heartbeat(&report);
+}
+
+static int send_neutral_input_state(enum macropad_operating_mode mode)
+{
+	uint8_t saved_keys = macropad_input_state.keys;
+	uint8_t saved_encoder_pressed = macropad_input_state.encoder_pressed;
+	int8_t saved_encoder_delta = macropad_input_state.encoder_delta;
+	int rc;
+
+	if (mode == MACROPAD_OPERATING_MODE_BLE) {
+		return ble_hid_send_key_state(0U);
+	}
+
+	macropad_input_state.keys = 0U;
+	macropad_input_state.encoder_delta = 0;
+	macropad_input_state.encoder_pressed = 0U;
+	rc = macropad_send_report();
+	macropad_input_state.keys = saved_keys;
+	macropad_input_state.encoder_delta = saved_encoder_delta;
+	macropad_input_state.encoder_pressed = saved_encoder_pressed;
+	return rc;
 }
 
 static int send_encoder_delta_reports(int32_t total_delta)
@@ -1201,7 +1252,7 @@ static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 
 	if (state->usb_power_present != usb_power_present) {
 		state->usb_power_present = usb_power_present;
-		macropad_input_state.usb_power_present = usb_power_present ? 1U : 0U;
+		update_battery_state(&macropad_input_state, usb_power_present, true);
 		if (usb_power_present) {
 			battery_policy_state.below_poweroff_since_ms = INT64_MIN;
 		}
@@ -1346,6 +1397,7 @@ int main(void)
 
 	//return macropad_keys_led_smoke_test();
 
+	log_boot_reset_state();
 	enforce_system_off_wake_hold();
 
 	struct app_event event;
@@ -1356,6 +1408,7 @@ int main(void)
 		.dongle_activity = false,
 		.usb_power_present = false,
 		.battery_warning_visible = false,
+		.keys_locked = false,
 		.last_delivery_success_ms = INT64_MIN,
 	};
 	struct options_menu_state options_menu = {
@@ -1412,6 +1465,7 @@ int main(void)
 		LOG_INF("Macropad LED config unavailable (rc=%d)", rc);
 	}
 	ui_state.operating_mode = macropad_config_get_operating_mode();
+	ui_state.keys_locked = macropad_config_get_keys_locked();
 	ble_feedback = macropad_config_get_ble_feedback();
 
 	rc = key_leds_init();
@@ -1424,7 +1478,7 @@ int main(void)
 		LOG_INF("Battery monitor unavailable (rc=%d)", rc);
 	}
 	ui_state.usb_power_present = status_usb_power_present();
-	refresh_battery_state(&macropad_input_state);
+	refresh_battery_state(&macropad_input_state, false);
 	ui_state.battery_warning_visible = battery_warning_visible(ui_state.usb_power_present,
 		k_uptime_get());
 	enforce_battery_policy(ui_state.usb_power_present, false, &battery_warning_logged);
@@ -1571,7 +1625,8 @@ int main(void)
 				size_t item_count;
 
 				options_menu_clamp(&options_menu, ui_state.operating_mode);
-				item_count = options_menu_labels(ui_state.operating_mode, menu_labels);
+				item_count = options_menu_labels(ui_state.operating_mode,
+					ui_state.keys_locked, menu_labels);
 				rc = status_display_render_menu("Options", menu_labels,
 					item_count, options_menu.selected_index,
 					options_menu.first_visible_index);
@@ -1745,6 +1800,11 @@ int main(void)
 				continue;
 			}
 
+			if (ui_state.keys_locked) {
+				redraw = true;
+				continue;
+			}
+
 			status_led_pulse(INPUT_ACTIVITY_LED_PULSE_MS);
 			redraw = true;
 
@@ -1894,9 +1954,29 @@ int main(void)
 					modal_menu_open(&dfu_confirm, 0U);
 				} else if (selected->action == OPTIONS_MENU_ACTION_POWER_OFF) {
 					modal_menu_open(&power_confirm, 0U);
+				} else if (selected->action == OPTIONS_MENU_ACTION_LOCK_KEYS) {
+					ui_state.keys_locked = !ui_state.keys_locked;
+					options_menu_close(&options_menu);
+					rc = macropad_config_store_keys_locked(ui_state.keys_locked);
+					if (rc != 0) {
+						LOG_WRN("Failed to persist key lock state: %d", rc);
+					}
+					if (ui_state.keys_locked) {
+						rc = send_neutral_input_state(ui_state.operating_mode);
+						if ((rc != 0) && (rc != -ENOTCONN) &&
+						    (rc != -EAGAIN)) {
+							LOG_WRN("Failed to send neutral input state: %d",
+								rc);
+						}
+					}
 				} else {
 					options_menu_close(&options_menu);
 				}
+				redraw = true;
+				continue;
+			}
+
+			if (ui_state.keys_locked) {
 				redraw = true;
 				continue;
 			}
@@ -1929,6 +2009,12 @@ int main(void)
 			if ((rc != 0) && (rc != -ENOTSUP)) {
 				LOG_WRN("Failed to update macropad LEDs: %d", rc);
 			}
+
+			if (ui_state.keys_locked) {
+				redraw = true;
+				continue;
+			}
+
 			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_BLE) {
 				rc = ble_hid_send_key_state(overlay_open ? 0U :
 					macropad_input_state.keys);

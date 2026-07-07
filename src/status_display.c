@@ -48,6 +48,7 @@ LOG_MODULE_REGISTER(status_display, LOG_LEVEL_INF);
 #define MODE_LABEL_DONGLE_X 18U
 #define MODE_LABEL_BLE_X 2U
 #define MODE_LABEL_Y 1U
+#define LOCKED_LABEL_X 67U
 #define COMPACT_GLYPH_WIDTH 5U
 #define COMPACT_GLYPH_HEIGHT 7U
 #define COMPACT_GLYPH_GAP 1U
@@ -414,6 +415,13 @@ static int draw_mode_label(enum macropad_operating_mode mode)
 	}
 
 	return draw_small_text(MODE_LABEL_DONGLE_X, MODE_LABEL_Y, "DONGLE");
+}
+
+static int draw_locked_label(void)
+{
+	return draw_compact_text_clipped(LOCKED_LABEL_X, MODE_LABEL_Y, "LOCKED",
+		(display_width_px > LOCKED_LABEL_X) ?
+			(uint16_t)(display_width_px - LOCKED_LABEL_X) : 0U);
 }
 
 static void tiny_digit_rows(uint8_t digit, uint8_t rows[TINY_GLYPH_HEIGHT])
@@ -1119,6 +1127,14 @@ int status_display_render(const struct status_display_state *state)
 		rc = draw_usb_icon();
 		if (rc != 0) {
 			LOG_ERR("draw USB icon failed: %d", rc);
+			return rc;
+		}
+	}
+
+	if (state->keys_locked) {
+		rc = draw_locked_label();
+		if (rc != 0) {
+			LOG_ERR("draw locked label failed: %d", rc);
 			return rc;
 		}
 	}

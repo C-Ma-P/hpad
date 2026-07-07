@@ -1,6 +1,7 @@
 #ifndef HPADV2_MACROPAD_CONFIG_H_
 #define HPADV2_MACROPAD_CONFIG_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "wire_protocol.h"
@@ -24,5 +25,7 @@ enum macropad_operating_mode macropad_config_get_operating_mode(void);
 int macropad_config_store_operating_mode(enum macropad_operating_mode mode);
 enum macropad_ble_feedback macropad_config_get_ble_feedback(void);
 int macropad_config_store_ble_feedback(enum macropad_ble_feedback feedback);
+bool macropad_config_get_keys_locked(void);
+int macropad_config_store_keys_locked(bool locked);
 
 #endif
