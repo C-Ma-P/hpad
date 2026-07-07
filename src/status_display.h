@@ -5,14 +5,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "ble_hid.h"
 #include "macropad_config.h"
+#include "macropad_mode.h"
 
 #define STATUS_DISPLAY_REFRESH_INTERVAL_MS 40
 
 struct status_display_state {
 	enum macropad_operating_mode operating_mode;
-	enum ble_hid_state ble_state;
+	enum macropad_ble_link_state ble_state;
 	bool connected;
 	bool dongle_activity;
 	bool usb_power_present;

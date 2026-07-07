@@ -17,6 +17,7 @@
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/sys/poweroff.h>
 #include <zephyr/sys/reboot.h>
+#include <zephyr/sys/util.h>
 
 #include <hal/nrf_power.h>
 
@@ -26,12 +27,14 @@
 #endif
 
 #include "battery.h"
-#include "ble_hid.h"
 #include "bringup.h"
+#include "desktop_ble_gatt.h"
 #include "encoder.h"
 #include "key_leds.h"
+#include "kindle_ble_hid.h"
 #include "macropad_config.h"
 #include "macropad_keys.h"
+#include "macropad_mode.h"
 #include "radio_esb.h"
 #include "status_display.h"
 #include "status_io.h"
@@ -56,6 +59,8 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define BATTERY_CRITICAL_BLINK_MS 500
 #define ENCODER_LONG_PRESS_MS 700
 #define OPTIONS_MENU_MAX_ITEM_COUNT 8U
+#define MODE_MENU_ITEM_COUNT 3U
+#define MODE_MENU_LABEL_MAX_LEN 22U
 #define POWER_CONFIRM_ITEM_COUNT 2U
 #define DFU_CONFIRM_ITEM_COUNT 2U
 #define FEEDBACK_ITEM_COUNT 4U
@@ -89,7 +94,7 @@ struct app_event {
 
 struct app_ui_state {
 	enum macropad_operating_mode operating_mode;
-	enum ble_hid_state ble_state;
+	enum macropad_ble_link_state ble_state;
 	bool connected;
 	bool dongle_activity;
 	bool usb_power_present;
@@ -130,6 +135,11 @@ struct modal_menu_state {
 	size_t first_visible_index;
 };
 
+struct mode_menu_labels {
+	char storage[MODE_MENU_ITEM_COUNT][MODE_MENU_LABEL_MAX_LEN];
+	const char *labels[MODE_MENU_ITEM_COUNT];
+};
+
 struct device_info_lines {
 	char storage[DEVICE_INFO_LINE_COUNT][DEVICE_INFO_LINE_MAX_LEN];
 	const char *lines[DEVICE_INFO_LINE_COUNT];
@@ -147,7 +157,6 @@ struct macropad_input_state {
 	uint16_t battery_mv;
 	uint8_t usb_power_present;
 };
-int a = 0; 
 
 K_MSGQ_DEFINE(app_event_queue, sizeof(struct app_event), APP_EVENT_QUEUE_LEN, 4);
 
@@ -172,6 +181,15 @@ static const struct options_menu_item options_menu_ble_items[] = {
 	{ .action = OPTIONS_MENU_ACTION_SWITCH_MODE },
 	{ .action = OPTIONS_MENU_ACTION_FEEDBACK },
 	{ .action = OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING },
+	{ .action = OPTIONS_MENU_ACTION_DEVICE_INFO },
+	{ .action = OPTIONS_MENU_ACTION_WIRELESS_FLASH },
+	{ .action = OPTIONS_MENU_ACTION_POWER_OFF },
+	{ .action = OPTIONS_MENU_ACTION_LOCK_KEYS },
+	{ .action = OPTIONS_MENU_ACTION_CLOSE },
+};
+
+static const struct options_menu_item options_menu_desktop_ble_items[] = {
+	{ .action = OPTIONS_MENU_ACTION_SWITCH_MODE },
 	{ .action = OPTIONS_MENU_ACTION_DEVICE_INFO },
 	{ .action = OPTIONS_MENU_ACTION_WIRELESS_FLASH },
 	{ .action = OPTIONS_MENU_ACTION_POWER_OFF },
@@ -317,22 +335,86 @@ static uint8_t battery_percent_from_mv(uint16_t mv)
 	return (uint8_t)((uint32_t)(mv - 3000U) * 100U / 1200U);
 }
 
-static const char *ble_info_link_label(enum ble_hid_state state)
+static enum macropad_ble_link_state kindle_ble_link_state(void)
+{
+	switch (kindle_ble_hid_get_state()) {
+	case KINDLE_BLE_HID_STATE_INACTIVE:
+		return MACROPAD_BLE_LINK_STATE_INACTIVE;
+	case KINDLE_BLE_HID_STATE_STARTING:
+		return MACROPAD_BLE_LINK_STATE_STARTING;
+	case KINDLE_BLE_HID_STATE_ADVERTISING:
+		return MACROPAD_BLE_LINK_STATE_ADVERTISING;
+	case KINDLE_BLE_HID_STATE_CONNECTED:
+		return MACROPAD_BLE_LINK_STATE_CONNECTED;
+	case KINDLE_BLE_HID_STATE_SECURITY_FAILED:
+		return MACROPAD_BLE_LINK_STATE_SECURITY_FAILED;
+	case KINDLE_BLE_HID_STATE_STOPPING:
+		return MACROPAD_BLE_LINK_STATE_STOPPING;
+	case KINDLE_BLE_HID_STATE_ERROR:
+	default:
+		return MACROPAD_BLE_LINK_STATE_ERROR;
+	}
+}
+
+static enum macropad_ble_link_state desktop_ble_link_state(void)
+{
+	switch (desktop_ble_gatt_get_state()) {
+	case DESKTOP_BLE_GATT_STATE_INACTIVE:
+		return MACROPAD_BLE_LINK_STATE_INACTIVE;
+	case DESKTOP_BLE_GATT_STATE_STARTING:
+		return MACROPAD_BLE_LINK_STATE_STARTING;
+	case DESKTOP_BLE_GATT_STATE_ADVERTISING:
+		return MACROPAD_BLE_LINK_STATE_ADVERTISING;
+	case DESKTOP_BLE_GATT_STATE_CONNECTED:
+		return MACROPAD_BLE_LINK_STATE_CONNECTED;
+	case DESKTOP_BLE_GATT_STATE_STOPPING:
+		return MACROPAD_BLE_LINK_STATE_STOPPING;
+	case DESKTOP_BLE_GATT_STATE_ERROR:
+	default:
+		return MACROPAD_BLE_LINK_STATE_ERROR;
+	}
+}
+
+static enum macropad_ble_link_state ble_link_state_for_mode(enum macropad_operating_mode mode)
+{
+	if (mode == MACROPAD_MODE_KINDLE_BLE) {
+		return kindle_ble_link_state();
+	}
+	if (mode == MACROPAD_MODE_DESKTOP_BLE) {
+		return desktop_ble_link_state();
+	}
+
+	return MACROPAD_BLE_LINK_STATE_INACTIVE;
+}
+
+static bool ble_connected_for_mode(enum macropad_operating_mode mode)
+{
+	if (mode == MACROPAD_MODE_KINDLE_BLE) {
+		return kindle_ble_hid_is_connected();
+	}
+	if (mode == MACROPAD_MODE_DESKTOP_BLE) {
+		return desktop_ble_gatt_is_connected();
+	}
+
+	return false;
+}
+
+static const char *ble_info_link_label(enum macropad_ble_link_state state)
 {
 	switch (state) {
-	case BLE_HID_STATE_INACTIVE:
+	case MACROPAD_BLE_LINK_STATE_INACTIVE:
 		return "Off";
-	case BLE_HID_STATE_STARTING:
+	case MACROPAD_BLE_LINK_STATE_STARTING:
 		return "Starting";
-	case BLE_HID_STATE_ADVERTISING:
+	case MACROPAD_BLE_LINK_STATE_ADVERTISING:
 		return "Ready";
-	case BLE_HID_STATE_CONNECTED:
+	case MACROPAD_BLE_LINK_STATE_CONNECTED:
 		return "Connected";
-	case BLE_HID_STATE_SECURITY_FAILED:
+	case MACROPAD_BLE_LINK_STATE_SECURITY_FAILED:
 		return "Pair Error";
-	case BLE_HID_STATE_STOPPING:
+	case MACROPAD_BLE_LINK_STATE_STOPPING:
 		return "Stopping";
-	case BLE_HID_STATE_ERROR:
+	case MACROPAD_BLE_LINK_STATE_ERROR:
 	default:
 		return "Error";
 	}
@@ -340,7 +422,7 @@ static const char *ble_info_link_label(enum ble_hid_state state)
 
 static const char *mode_info_label(enum macropad_operating_mode mode)
 {
-	return (mode == MACROPAD_OPERATING_MODE_BLE) ? "BLE" : "Dongle";
+	return macropad_mode_display_name(mode);
 }
 
 static void build_device_info_lines(const struct app_ui_state *ui_state,
@@ -354,8 +436,8 @@ static void build_device_info_lines(const struct app_ui_state *ui_state,
 		info->lines[index] = info->storage[index];
 	}
 
-	if (ui_state->operating_mode == MACROPAD_OPERATING_MODE_BLE) {
-		link_label = ble_info_link_label(ble_hid_get_state());
+	if (macropad_mode_is_ble(ui_state->operating_mode)) {
+		link_label = ble_info_link_label(ble_link_state_for_mode(ui_state->operating_mode));
 	} else {
 		link_label = ui_state->connected ? "Connected" : "Waiting";
 	}
@@ -372,25 +454,52 @@ static void build_device_info_lines(const struct app_ui_state *ui_state,
 		ui_state->usb_power_present ? "Yes" : "No");
 }
 
-static enum macropad_operating_mode opposite_mode(enum macropad_operating_mode mode)
+static enum macropad_operating_mode mode_menu_target(size_t index)
 {
-	return (mode == MACROPAD_OPERATING_MODE_BLE) ?
-		MACROPAD_OPERATING_MODE_DONGLE : MACROPAD_OPERATING_MODE_BLE;
+	return macropad_mode_at(index);
 }
 
 static const char *mode_menu_label(enum macropad_operating_mode current_mode)
 {
-	return (current_mode == MACROPAD_OPERATING_MODE_BLE) ?
-		"Dongle Mode" : "BLE Mode";
+	ARG_UNUSED(current_mode);
+	return "Mode";
+}
+
+static size_t mode_menu_index(enum macropad_operating_mode current_mode)
+{
+	for (size_t index = 0U; index < macropad_mode_count(); ++index) {
+		if (macropad_mode_at(index) == current_mode) {
+			return index;
+		}
+	}
+
+	return 0U;
+}
+
+static void build_mode_menu_labels(enum macropad_operating_mode current_mode,
+				   struct mode_menu_labels *menu_labels)
+{
+	for (size_t index = 0U; index < MODE_MENU_ITEM_COUNT; ++index) {
+		enum macropad_operating_mode mode = mode_menu_target(index);
+		const char *prefix = (mode == current_mode) ? "* " : "  ";
+
+		menu_labels->labels[index] = menu_labels->storage[index];
+		(void)snprintf(menu_labels->storage[index], sizeof(menu_labels->storage[index]),
+			"%s%s", prefix, macropad_mode_display_name(mode));
+	}
 }
 
 static const struct options_menu_item *
 options_menu_items_for_mode(enum macropad_operating_mode current_mode,
 			    size_t *item_count)
 {
-	if (current_mode == MACROPAD_OPERATING_MODE_BLE) {
+	if (current_mode == MACROPAD_MODE_KINDLE_BLE) {
 		*item_count = ARRAY_SIZE(options_menu_ble_items);
 		return options_menu_ble_items;
+	}
+	if (current_mode == MACROPAD_MODE_DESKTOP_BLE) {
+		*item_count = ARRAY_SIZE(options_menu_desktop_ble_items);
+		return options_menu_desktop_ble_items;
 	}
 
 	*item_count = ARRAY_SIZE(options_menu_dongle_items);
@@ -621,12 +730,13 @@ static size_t feedback_index(enum macropad_ble_feedback feedback)
 }
 
 static bool local_overlay_open(const struct options_menu_state *options_menu,
+			       const struct modal_menu_state *mode_menu,
 			       const struct device_info_state *device_info,
 			       const struct modal_menu_state *feedback_menu,
 			       const struct modal_menu_state *power_confirm,
 			       const struct modal_menu_state *dfu_confirm)
 {
-	return options_menu->open || device_info->open ||
+	return options_menu->open || mode_menu->open || device_info->open ||
 		feedback_menu->open || power_confirm->open ||
 		dfu_confirm->open;
 }
@@ -640,7 +750,7 @@ static int apply_key_feedback(enum macropad_operating_mode mode,
 			      enum macropad_ble_feedback ble_feedback,
 			      uint8_t keys)
 {
-	if (mode == MACROPAD_OPERATING_MODE_BLE) {
+	if (macropad_mode_endpoint(mode) == MACROPAD_ENDPOINT_KINDLE) {
 		return key_leds_update_ble_feedback(keys, ble_feedback);
 	}
 
@@ -694,14 +804,12 @@ static void show_transient_message(bool display_available, bool *display_sleepin
 
 static const char *starting_message(enum macropad_operating_mode mode)
 {
-	return (mode == MACROPAD_OPERATING_MODE_BLE) ?
-		"Starting BLE..." : "Starting Dongle...";
+	return macropad_mode_is_ble(mode) ? "Starting BLE..." : "Starting Dongle...";
 }
 
 static const char *failed_message(enum macropad_operating_mode mode)
 {
-	return (mode == MACROPAD_OPERATING_MODE_BLE) ?
-		"BLE failed" : "Dongle failed";
+	return macropad_mode_is_ble(mode) ? "BLE failed" : "Dongle failed";
 }
 
 static int start_dongle_transport(void)
@@ -761,21 +869,27 @@ static int start_dongle_transport(void)
 
 static int start_transport(enum macropad_operating_mode mode)
 {
-	if (mode == MACROPAD_OPERATING_MODE_BLE) {
-		return ble_hid_start();
+	if (macropad_mode_transport(mode) == MACROPAD_TRANSPORT_ESB) {
+		return start_dongle_transport();
+	}
+	if (macropad_mode_endpoint(mode) == MACROPAD_ENDPOINT_KINDLE) {
+		return kindle_ble_hid_start();
 	}
 
-	return start_dongle_transport();
+	return desktop_ble_gatt_start();
 }
 
 static int stop_transport(enum macropad_operating_mode mode)
 {
-	if (mode == MACROPAD_OPERATING_MODE_BLE) {
-		(void)ble_hid_send_key_state(0U);
-		return ble_hid_stop();
+	if (macropad_mode_transport(mode) == MACROPAD_TRANSPORT_ESB) {
+		return radio_esb_stop();
+	}
+	if (macropad_mode_endpoint(mode) == MACROPAD_ENDPOINT_KINDLE) {
+		(void)kindle_ble_hid_send_key_state(0U);
+		return kindle_ble_hid_stop();
 	}
 
-	return radio_esb_stop();
+	return desktop_ble_gatt_stop();
 }
 
 static int switch_operating_mode(struct app_ui_state *ui_state,
@@ -802,7 +916,7 @@ static int switch_operating_mode(struct app_ui_state *ui_state,
 	if (rc != 0) {
 		LOG_ERR("Failed to start mode %u: %d", target_mode, rc);
 		(void)start_transport(previous_mode);
-		ui_state->ble_state = ble_hid_get_state();
+		ui_state->ble_state = ble_link_state_for_mode(previous_mode);
 		show_transient_message(display_available, display_sleeping,
 			failed_message(target_mode), "Restored old mode",
 			TRANSIENT_MESSAGE_HOLD_MS);
@@ -815,7 +929,7 @@ static int switch_operating_mode(struct app_ui_state *ui_state,
 	}
 
 	ui_state->operating_mode = target_mode;
-	ui_state->ble_state = ble_hid_get_state();
+	ui_state->ble_state = ble_link_state_for_mode(target_mode);
 	ui_state->connected = false;
 	ui_state->dongle_activity = false;
 	ui_state->last_delivery_success_ms = INT64_MIN;
@@ -827,18 +941,18 @@ static int forget_ble_pairing(struct app_ui_state *ui_state,
 {
 	int rc;
 
-	if (ui_state->operating_mode != MACROPAD_OPERATING_MODE_BLE) {
+	if (!macropad_mode_has_pairing(ui_state->operating_mode)) {
 		show_transient_message(display_available, display_sleeping,
-			"Use BLE mode", "to forget", TRANSIENT_MESSAGE_HOLD_MS);
+			"No pairing", "for this mode", TRANSIENT_MESSAGE_HOLD_MS);
 		return -EAGAIN;
 	}
 
 	show_transient_message(display_available, display_sleeping,
 		"Forgetting BLE...", NULL, 0);
 
-	rc = ble_hid_forget_pairing();
-	ui_state->ble_state = ble_hid_get_state();
-	ui_state->connected = ble_hid_is_connected();
+	rc = kindle_ble_hid_forget_pairing();
+	ui_state->ble_state = ble_link_state_for_mode(ui_state->operating_mode);
+	ui_state->connected = ble_connected_for_mode(ui_state->operating_mode);
 	ui_state->dongle_activity = false;
 	if (rc != 0) {
 		show_transient_message(display_available, display_sleeping,
@@ -1066,7 +1180,7 @@ static struct status_display_state make_display_state(const struct app_ui_state 
 	};
 }
 
-static int macropad_send_report(void)
+static int macropad_send_report(enum macropad_operating_mode mode)
 {
 	macropad_report_t report;
 
@@ -1079,10 +1193,14 @@ static int macropad_send_report(void)
 		.usb_power_present = macropad_input_state.usb_power_present,
 	};
 
+	if (mode == MACROPAD_MODE_DESKTOP_BLE) {
+		return desktop_ble_gatt_send_report(&report);
+	}
+
 	return radio_esb_send_macropad_report(&report);
 }
 
-static int macropad_send_heartbeat(void)
+static int macropad_send_heartbeat(enum macropad_operating_mode mode)
 {
 	macropad_report_t report = {
 		.keys = 0U,
@@ -1094,6 +1212,10 @@ static int macropad_send_heartbeat(void)
 	report.battery_mv = macropad_input_state.battery_mv;
 	report.usb_power_present = macropad_input_state.usb_power_present;
 
+	if (mode == MACROPAD_MODE_DESKTOP_BLE) {
+		return desktop_ble_gatt_send_report(&report);
+	}
+
 	return radio_esb_send_heartbeat(&report);
 }
 
@@ -1104,21 +1226,21 @@ static int send_neutral_input_state(enum macropad_operating_mode mode)
 	int8_t saved_encoder_delta = macropad_input_state.encoder_delta;
 	int rc;
 
-	if (mode == MACROPAD_OPERATING_MODE_BLE) {
-		return ble_hid_send_key_state(0U);
+	if (macropad_mode_endpoint(mode) == MACROPAD_ENDPOINT_KINDLE) {
+		return kindle_ble_hid_send_key_state(0U);
 	}
 
 	macropad_input_state.keys = 0U;
 	macropad_input_state.encoder_delta = 0;
 	macropad_input_state.encoder_pressed = 0U;
-	rc = macropad_send_report();
+	rc = macropad_send_report(mode);
 	macropad_input_state.keys = saved_keys;
 	macropad_input_state.encoder_delta = saved_encoder_delta;
 	macropad_input_state.encoder_pressed = saved_encoder_pressed;
 	return rc;
 }
 
-static int send_encoder_delta_reports(int32_t total_delta)
+static int send_encoder_delta_reports(enum macropad_operating_mode mode, int32_t total_delta)
 {
 	int rc = 0;
 	int8_t step_delta;
@@ -1133,7 +1255,7 @@ static int send_encoder_delta_reports(int32_t total_delta)
 		}
 
 		macropad_input_state.encoder_delta = step_delta;
-		rc = macropad_send_report();
+		rc = macropad_send_report(mode);
 		if (rc != 0) {
 			break;
 		}
@@ -1145,19 +1267,19 @@ static int send_encoder_delta_reports(int32_t total_delta)
 	return rc;
 }
 
-static int send_encoder_button_click_report(void)
+static int send_encoder_button_click_report(enum macropad_operating_mode mode)
 {
 	int rc;
 
 	macropad_input_state.encoder_pressed = 1U;
-	rc = macropad_send_report();
+	rc = macropad_send_report(mode);
 	if (rc != 0) {
 		macropad_input_state.encoder_pressed = 0U;
 		return rc;
 	}
 
 	macropad_input_state.encoder_pressed = 0U;
-	return macropad_send_report();
+	return macropad_send_report(mode);
 }
 
 static void handle_encoder_delta(int8_t delta)
@@ -1248,7 +1370,7 @@ static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 	bool dongle_activity;
 	bool warning_visible;
 	bool connected;
-	enum ble_hid_state ble_state;
+	enum macropad_ble_link_state ble_state;
 
 	if (state->usb_power_present != usb_power_present) {
 		state->usb_power_present = usb_power_present;
@@ -1259,13 +1381,13 @@ static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
 		dirty = true;
 	}
 
-	if (state->operating_mode == MACROPAD_OPERATING_MODE_BLE) {
-		ble_state = ble_hid_get_state();
+	if (macropad_mode_is_ble(state->operating_mode)) {
+		ble_state = ble_link_state_for_mode(state->operating_mode);
 		if (state->ble_state != ble_state) {
 			state->ble_state = ble_state;
 			dirty = true;
 		}
-		connected = ble_hid_is_connected();
+		connected = ble_connected_for_mode(state->operating_mode);
 		if (state->connected != connected) {
 			state->connected = connected;
 			dirty = true;
@@ -1402,8 +1524,8 @@ int main(void)
 
 	struct app_event event;
 	struct app_ui_state ui_state = {
-		.operating_mode = MACROPAD_OPERATING_MODE_DONGLE,
-		.ble_state = BLE_HID_STATE_INACTIVE,
+		.operating_mode = MACROPAD_MODE_DESKTOP_DONGLE,
+		.ble_state = MACROPAD_BLE_LINK_STATE_INACTIVE,
 		.connected = false,
 		.dongle_activity = false,
 		.usb_power_present = false,
@@ -1412,6 +1534,11 @@ int main(void)
 		.last_delivery_success_ms = INT64_MIN,
 	};
 	struct options_menu_state options_menu = {
+		.open = false,
+		.selected_index = 0U,
+		.first_visible_index = 0U,
+	};
+	struct modal_menu_state mode_menu = {
 		.open = false,
 		.selected_index = 0U,
 		.first_visible_index = 0U,
@@ -1467,6 +1594,7 @@ int main(void)
 	ui_state.operating_mode = macropad_config_get_operating_mode();
 	ui_state.keys_locked = macropad_config_get_keys_locked();
 	ble_feedback = macropad_config_get_ble_feedback();
+	desktop_ble_gatt_set_config_handler(handle_radio_config);
 
 	rc = key_leds_init();
 	if (rc != 0) {
@@ -1531,7 +1659,7 @@ int main(void)
 		LOG_ERR("Failed to start saved mode %u: %d", ui_state.operating_mode, rc);
 		return 0;
 	}
-	ui_state.ble_state = ble_hid_get_state();
+	ui_state.ble_state = ble_link_state_for_mode(ui_state.operating_mode);
 
 	LOG_INF("Macropad sender ready in mode %u", ui_state.operating_mode);
 	next_heartbeat_ms = k_uptime_get();
@@ -1564,6 +1692,9 @@ int main(void)
 			} else if (power_confirm.open) {
 				modal_menu_close(&power_confirm);
 				options_menu_close(&options_menu);
+			} else if (mode_menu.open) {
+				modal_menu_close(&mode_menu);
+				options_menu_close(&options_menu);
 			} else if (feedback_menu.open) {
 				modal_menu_close(&feedback_menu);
 				options_menu_close(&options_menu);
@@ -1583,8 +1714,8 @@ int main(void)
 		}
 
 		if (now_ms >= next_heartbeat_ms) {
-			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
-				rc = macropad_send_heartbeat();
+			if (macropad_mode_is_desktop(ui_state.operating_mode)) {
+				rc = macropad_send_heartbeat(ui_state.operating_mode);
 				if (rc != 0) {
 					LOG_WRN("macropad_send_heartbeat failed: %d", rc);
 				}
@@ -1609,6 +1740,14 @@ int main(void)
 				rc = status_display_render_menu("Power Off?", power_confirm_labels,
 					POWER_CONFIRM_ITEM_COUNT, power_confirm.selected_index,
 					power_confirm.first_visible_index);
+			} else if (mode_menu.open) {
+				struct mode_menu_labels mode_labels;
+
+				modal_menu_move(&mode_menu, MODE_MENU_ITEM_COUNT, 0);
+				build_mode_menu_labels(ui_state.operating_mode, &mode_labels);
+				rc = status_display_render_menu("Mode", mode_labels.labels,
+					MODE_MENU_ITEM_COUNT, mode_menu.selected_index,
+					mode_menu.first_visible_index);
 			} else if (feedback_menu.open) {
 				modal_menu_move(&feedback_menu, FEEDBACK_ITEM_COUNT, 0);
 				rc = status_display_render_menu("Feedback", feedback_labels,
@@ -1695,7 +1834,7 @@ int main(void)
 			}
 		}
 
-		if ((ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) &&
+		if ((macropad_mode_transport(ui_state.operating_mode) == MACROPAD_TRANSPORT_ESB) &&
 		    ui_state.connected && (ui_state.last_delivery_success_ms != INT64_MIN)) {
 			int64_t disconnect_wait_ms =
 				(ui_state.last_delivery_success_ms + CONNECTION_TIMEOUT_MS) - now_ms;
@@ -1774,6 +1913,12 @@ int main(void)
 				continue;
 			}
 
+			if (mode_menu.open) {
+				modal_menu_move(&mode_menu, MODE_MENU_ITEM_COUNT, encoder_delta);
+				redraw = true;
+				continue;
+			}
+
 			if (feedback_menu.open) {
 				size_t previous_index = feedback_menu.selected_index;
 
@@ -1808,21 +1953,21 @@ int main(void)
 			status_led_pulse(INPUT_ACTIVITY_LED_PULSE_MS);
 			redraw = true;
 
-			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
-				rc = send_encoder_delta_reports(encoder_delta);
+			if (macropad_mode_is_desktop(ui_state.operating_mode)) {
+				rc = send_encoder_delta_reports(ui_state.operating_mode, encoder_delta);
 				if (rc != 0) {
 					LOG_ERR("send_encoder_delta_reports failed: %d", rc);
 				}
 			} else {
 				while (encoder_delta != 0) {
 					uint8_t usage = (encoder_delta > 0) ?
-						BLE_HID_USAGE_KEYBOARD_DOWN_ARROW :
-						BLE_HID_USAGE_KEYBOARD_UP_ARROW;
+						KINDLE_BLE_HID_USAGE_KEYBOARD_DOWN_ARROW :
+						KINDLE_BLE_HID_USAGE_KEYBOARD_UP_ARROW;
 
-					rc = ble_hid_send_key_tap(usage);
+					rc = kindle_ble_hid_send_key_tap(usage);
 					if ((rc != 0) && (rc != -ENOTCONN) &&
 					    (rc != -EAGAIN)) {
-						LOG_ERR("ble_hid_send_key_tap failed: %d", rc);
+						LOG_ERR("kindle_ble_hid_send_key_tap failed: %d", rc);
 						break;
 					}
 					encoder_delta += (encoder_delta > 0) ? -1 : 1;
@@ -1833,7 +1978,7 @@ int main(void)
 				encoder_button_down = true;
 				encoder_button_down_ms = now_ms;
 				encoder_long_press_consumed = false;
-				if ((ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) ||
+				if (macropad_mode_is_desktop(ui_state.operating_mode) ||
 				    ble_feedback_uses_buzzer(ble_feedback)) {
 					status_buzzer_set(true);
 				}
@@ -1873,6 +2018,26 @@ int main(void)
 					options_menu_close(&options_menu);
 					perform_user_poweroff(ui_state.operating_mode,
 						display_available, &display_sleeping);
+				}
+				redraw = true;
+				continue;
+			}
+
+			if (mode_menu.open) {
+				enum macropad_operating_mode target_mode =
+					mode_menu_target(mode_menu.selected_index);
+
+				modal_menu_close(&mode_menu);
+				options_menu_close(&options_menu);
+				rc = switch_operating_mode(&ui_state, target_mode,
+					display_available, &display_sleeping);
+				if (rc != 0) {
+					LOG_ERR("switch_operating_mode failed: %d", rc);
+				}
+				rc = apply_key_feedback(ui_state.operating_mode, ble_feedback,
+					macropad_input_state.keys);
+				if ((rc != 0) && (rc != -ENOTSUP)) {
+					LOG_WRN("Failed to refresh key feedback: %d", rc);
 				}
 				redraw = true;
 				continue;
@@ -1922,20 +2087,8 @@ int main(void)
 				selected = &items[options_menu.selected_index];
 
 				if (selected->action == OPTIONS_MENU_ACTION_SWITCH_MODE) {
-					enum macropad_operating_mode target_mode =
-						opposite_mode(ui_state.operating_mode);
-
-					options_menu_close(&options_menu);
-					rc = switch_operating_mode(&ui_state, target_mode,
-						display_available, &display_sleeping);
-					if (rc != 0) {
-						LOG_ERR("switch_operating_mode failed: %d", rc);
-					}
-					rc = apply_key_feedback(ui_state.operating_mode,
-						ble_feedback, macropad_input_state.keys);
-					if ((rc != 0) && (rc != -ENOTSUP)) {
-						LOG_WRN("Failed to refresh key feedback: %d", rc);
-					}
+					modal_menu_open(&mode_menu,
+						mode_menu_index(ui_state.operating_mode));
 				} else if (selected->action ==
 					   OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING) {
 					options_menu_close(&options_menu);
@@ -1981,23 +2134,23 @@ int main(void)
 				continue;
 			}
 
-			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
-				rc = send_encoder_button_click_report();
+			if (macropad_mode_is_desktop(ui_state.operating_mode)) {
+				rc = send_encoder_button_click_report(ui_state.operating_mode);
 				if (rc != 0) {
 					LOG_ERR("send_encoder_button_click_report failed: %d", rc);
 				}
 			} else {
-				rc = ble_hid_send_key_tap(BLE_HID_USAGE_KEYBOARD_ENTER);
+				rc = kindle_ble_hid_send_key_tap(KINDLE_BLE_HID_USAGE_KEYBOARD_ENTER);
 				if ((rc != 0) && (rc != -ENOTCONN) && (rc != -EAGAIN)) {
-					LOG_ERR("ble_hid_send_key_tap enter failed: %d", rc);
+					LOG_ERR("kindle_ble_hid_send_key_tap enter failed: %d", rc);
 				}
 			}
 			redraw = true;
 		} else if (event.type == APP_EVENT_MACROPAD_KEYS) {
-			bool overlay_open = local_overlay_open(&options_menu, &device_info,
-				&feedback_menu, &power_confirm, &dfu_confirm);
+			bool overlay_open = local_overlay_open(&options_menu, &mode_menu,
+				&device_info, &feedback_menu, &power_confirm, &dfu_confirm);
 
-			if ((ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) &&
+			if ((macropad_mode_transport(ui_state.operating_mode) == MACROPAD_TRANSPORT_ESB) &&
 			    device_info.open) {
 				redraw = true;
 				continue;
@@ -2015,14 +2168,14 @@ int main(void)
 				continue;
 			}
 
-			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_BLE) {
-				rc = ble_hid_send_key_state(overlay_open ? 0U :
+			if (macropad_mode_endpoint(ui_state.operating_mode) == MACROPAD_ENDPOINT_KINDLE) {
+				rc = kindle_ble_hid_send_key_state(overlay_open ? 0U :
 					macropad_input_state.keys);
 				if ((rc != 0) && (rc != -ENOTCONN) && (rc != -EAGAIN)) {
-					LOG_ERR("ble_hid_send_key_state failed: %d", rc);
+					LOG_ERR("kindle_ble_hid_send_key_state failed: %d", rc);
 				}
 			} else {
-				rc = macropad_send_report();
+				rc = macropad_send_report(ui_state.operating_mode);
 				if (rc != 0) {
 					LOG_ERR("macropad_send_report failed: %d", rc);
 				}
@@ -2032,15 +2185,15 @@ int main(void)
 				continue;
 			}
 
-			if ((ui_state.operating_mode == MACROPAD_OPERATING_MODE_BLE) &&
+			if ((macropad_mode_endpoint(ui_state.operating_mode) == MACROPAD_ENDPOINT_KINDLE) &&
 			    ble_feedback_uses_buzzer(ble_feedback) && !overlay_open) {
 				status_buzzer_pulse(FEEDBACK_PREVIEW_MS);
-			} else if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
+			} else if (macropad_mode_is_desktop(ui_state.operating_mode)) {
 				status_led_pulse(INPUT_ACTIVITY_LED_PULSE_MS);
 			}
 			redraw = true;
 		} else if (event.type == APP_EVENT_MACROPAD_CONFIG) {
-			if (ui_state.operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
+			if (macropad_mode_is_desktop(ui_state.operating_mode)) {
 				key_leds_apply_config(&event.config);
 				rc = apply_key_feedback(ui_state.operating_mode, ble_feedback,
 					macropad_input_state.keys);

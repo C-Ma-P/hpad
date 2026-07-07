@@ -387,21 +387,21 @@ static int draw_usb_icon(void)
 	return draw_bitmap(x, TOP_ICON_Y, USB_ICON_WIDTH, USB_ICON_HEIGHT, rows);
 }
 
-static const char *ble_status_text(enum ble_hid_state state)
+static const char *ble_status_text(enum macropad_ble_link_state state)
 {
 	switch (state) {
-	case BLE_HID_STATE_INACTIVE:
+	case MACROPAD_BLE_LINK_STATE_INACTIVE:
 		return "BLE OFF";
-	case BLE_HID_STATE_STARTING:
+	case MACROPAD_BLE_LINK_STATE_STARTING:
 		return "BLE START";
-	case BLE_HID_STATE_ADVERTISING:
+	case MACROPAD_BLE_LINK_STATE_ADVERTISING:
 		return "BLE READY";
-	case BLE_HID_STATE_CONNECTED:
+	case MACROPAD_BLE_LINK_STATE_CONNECTED:
 		return "BLE LINKED";
-	case BLE_HID_STATE_SECURITY_FAILED:
-	case BLE_HID_STATE_ERROR:
+	case MACROPAD_BLE_LINK_STATE_SECURITY_FAILED:
+	case MACROPAD_BLE_LINK_STATE_ERROR:
 		return "BLE ERR";
-	case BLE_HID_STATE_STOPPING:
+	case MACROPAD_BLE_LINK_STATE_STOPPING:
 		return "BLE STOP";
 	default:
 		return "BLE ?";
@@ -410,11 +410,11 @@ static const char *ble_status_text(enum ble_hid_state state)
 
 static int draw_mode_label(enum macropad_operating_mode mode)
 {
-	if (mode == MACROPAD_OPERATING_MODE_BLE) {
-		return draw_small_text(MODE_LABEL_BLE_X, MODE_LABEL_Y, "BLE");
-	}
+	const uint16_t x = (macropad_mode_transport(mode) == MACROPAD_TRANSPORT_ESB) ?
+		MODE_LABEL_DONGLE_X : MODE_LABEL_BLE_X;
 
-	return draw_small_text(MODE_LABEL_DONGLE_X, MODE_LABEL_Y, "DONGLE");
+	return draw_small_text(x, MODE_LABEL_Y,
+		macropad_mode_short_name(mode));
 }
 
 static int draw_locked_label(void)
@@ -999,6 +999,10 @@ static int draw_battery_meter(uint16_t battery_mv, bool usb_power_present)
 	const uint16_t cap_y = BATTERY_BODY_Y + ((BATTERY_BODY_HEIGHT - BATTERY_CAP_HEIGHT) / 2U);
 	int rc;
 
+	if ((battery_mv == 0U) && !usb_power_present) {
+		return 0;
+	}
+
 	rc = draw_rounded_rect(BATTERY_BODY_X, BATTERY_BODY_Y,
 		BATTERY_BODY_WIDTH, BATTERY_BODY_HEIGHT);
 	if (rc != 0) {
@@ -1011,12 +1015,7 @@ static int draw_battery_meter(uint16_t battery_mv, bool usb_power_present)
 	}
 
 	if (usb_power_present) {
-		rc = draw_charging_bolt();
-		if (rc != 0) {
-			return rc;
-		}
-
-		return draw_small_text(BATTERY_PERCENT_X, BATTERY_PERCENT_Y, "CHG");
+		return draw_charging_bolt();
 	}
 
 	if (fill_width > 0U) {
@@ -1095,7 +1094,7 @@ int status_display_render(const struct status_display_state *state)
 		return rc;
 	}
 
-	if (state->operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
+	if (macropad_mode_transport(state->operating_mode) == MACROPAD_TRANSPORT_ESB) {
 		rc = draw_dongle_icon(state->connected, state->dongle_activity);
 		if (rc != 0) {
 			LOG_ERR("draw dongle icon failed: %d", rc);

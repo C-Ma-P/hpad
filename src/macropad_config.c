@@ -7,6 +7,8 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 
+#include "macropad_mode.h"
+
 LOG_MODULE_REGISTER(macropad_config, LOG_LEVEL_INF);
 
 #define MACROPAD_CONFIG_SETTINGS_ROOT "macropad_cfg"
@@ -40,8 +42,7 @@ static bool macropad_config_valid(const macropad_config_t *config)
 
 static bool macropad_operating_mode_valid(uint8_t mode)
 {
-	return (mode == MACROPAD_OPERATING_MODE_DONGLE) ||
-		(mode == MACROPAD_OPERATING_MODE_BLE);
+	return macropad_mode_valid((enum macropad_operating_mode)mode);
 }
 
 static bool macropad_ble_feedback_valid(uint8_t feedback)
@@ -183,7 +184,7 @@ int macropad_config_init(void)
 
 	macropad_config_default(&stored_config);
 	stored_config_loaded = false;
-	stored_operating_mode = MACROPAD_OPERATING_MODE_DONGLE;
+	stored_operating_mode = MACROPAD_MODE_DESKTOP_DONGLE;
 	stored_operating_mode_loaded = false;
 	stored_ble_feedback = MACROPAD_BLE_FEEDBACK_LED_MED;
 	stored_ble_feedback_loaded = false;
