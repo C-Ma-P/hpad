@@ -15,7 +15,6 @@ LOG_MODULE_REGISTER(macropad_config, LOG_LEVEL_INF);
 #define MACROPAD_CONFIG_SETTINGS_KEY MACROPAD_CONFIG_SETTINGS_ROOT "/leds"
 #define MACROPAD_MODE_SETTINGS_KEY MACROPAD_CONFIG_SETTINGS_ROOT "/mode"
 #define MACROPAD_BLE_FEEDBACK_SETTINGS_KEY MACROPAD_CONFIG_SETTINGS_ROOT "/ble_feedback"
-#define MACROPAD_KEYS_LOCKED_SETTINGS_KEY MACROPAD_CONFIG_SETTINGS_ROOT "/keys_locked"
 
 static macropad_config_t stored_config;
 static bool stored_config_loaded;
@@ -24,7 +23,6 @@ static bool stored_operating_mode_loaded;
 static enum macropad_ble_feedback stored_ble_feedback;
 static bool stored_ble_feedback_loaded;
 static bool stored_keys_locked;
-static bool stored_keys_locked_loaded;
 
 static void macropad_config_default(macropad_config_t *config)
 {
@@ -120,27 +118,7 @@ static int macropad_config_settings_set(const char *name, size_t len_rd,
 	}
 
 	if (settings_name_steq(name, "keys_locked", NULL)) {
-		uint8_t loaded_keys_locked;
-
-		if (len_rd != sizeof(loaded_keys_locked)) {
-			LOG_WRN("Stored key lock length %zu does not match expected %zu",
-				len_rd, sizeof(loaded_keys_locked));
-			stored_keys_locked_loaded = false;
-			return 0;
-		}
-
-		rc = read_cb(cb_arg, &loaded_keys_locked, sizeof(loaded_keys_locked));
-		if (rc < 0) {
-			return rc;
-		}
-		if (rc != sizeof(loaded_keys_locked)) {
-			LOG_WRN("Settings read returned %d bytes for key lock", rc);
-			stored_keys_locked_loaded = false;
-			return 0;
-		}
-
-		stored_keys_locked = (loaded_keys_locked != 0U);
-		stored_keys_locked_loaded = true;
+		LOG_INF("Ignoring persisted key lock state; defaulting to unlocked on boot");
 		return 0;
 	}
 
@@ -189,7 +167,6 @@ int macropad_config_init(void)
 	stored_ble_feedback = MACROPAD_BLE_FEEDBACK_LED_MED;
 	stored_ble_feedback_loaded = false;
 	stored_keys_locked = false;
-	stored_keys_locked_loaded = false;
 
 	rc = settings_subsys_init();
 	if ((rc != 0) && (rc != -EALREADY)) {
@@ -218,11 +195,7 @@ int macropad_config_init(void)
 	} else {
 		LOG_INF("No persisted BLE feedback found, defaulting to medium LED");
 	}
-	if (stored_keys_locked_loaded) {
-		LOG_INF("Loaded persisted key lock state %u", stored_keys_locked ? 1U : 0U);
-	} else {
-		LOG_INF("No persisted key lock state found, defaulting to unlocked");
-	}
+	LOG_INF("Key lock defaulted to unlocked");
 
 	return 0;
 }
@@ -327,22 +300,11 @@ bool macropad_config_get_keys_locked(void)
 
 int macropad_config_store_keys_locked(bool locked)
 {
-	uint8_t stored_locked = locked ? 1U : 0U;
-	int rc;
-
-	if (stored_keys_locked_loaded && (stored_keys_locked == locked)) {
+	if (stored_keys_locked == locked) {
 		return 0;
 	}
 
 	stored_keys_locked = locked;
-	stored_keys_locked_loaded = true;
-	rc = settings_save_one(MACROPAD_KEYS_LOCKED_SETTINGS_KEY, &stored_locked,
-			       sizeof(stored_locked));
-	if (rc != 0) {
-		LOG_WRN("settings_save_one failed: %d, keeping key lock in memory", rc);
-		return rc;
-	}
-
-	LOG_INF("Stored key lock state %u", stored_locked);
+	LOG_INF("Updated volatile key lock state %u", locked ? 1U : 0U);
 	return 0;
 }

@@ -461,8 +461,7 @@ static enum macropad_operating_mode mode_menu_target(size_t index)
 
 static const char *mode_menu_label(enum macropad_operating_mode current_mode)
 {
-	ARG_UNUSED(current_mode);
-	return "Mode";
+	return macropad_mode_is_ble(current_mode) ? "Dongle Mode" : "BLE Mode";
 }
 
 static size_t mode_menu_index(enum macropad_operating_mode current_mode)
@@ -1657,7 +1656,26 @@ int main(void)
 	rc = start_transport(ui_state.operating_mode);
 	if (rc != 0) {
 		LOG_ERR("Failed to start saved mode %u: %d", ui_state.operating_mode, rc);
-		return 0;
+		if (ui_state.operating_mode == MACROPAD_MODE_DESKTOP_DONGLE) {
+			return 0;
+		}
+
+		ui_state.operating_mode = MACROPAD_MODE_DESKTOP_DONGLE;
+		rc = start_transport(ui_state.operating_mode);
+		if (rc != 0) {
+			LOG_ERR("Failed to start fallback dongle mode: %d", rc);
+			return 0;
+		}
+		rc = macropad_config_store_operating_mode(ui_state.operating_mode);
+		if (rc != 0) {
+			LOG_WRN("Failed to persist fallback dongle mode: %d", rc);
+		}
+		rc = apply_key_feedback(ui_state.operating_mode, ble_feedback,
+			macropad_input_state.keys);
+		if (rc != 0) {
+			LOG_WRN("Failed to refresh fallback key feedback: %d", rc);
+		}
+		redraw = true;
 	}
 	ui_state.ble_state = ble_link_state_for_mode(ui_state.operating_mode);
 
@@ -2112,7 +2130,7 @@ int main(void)
 					options_menu_close(&options_menu);
 					rc = macropad_config_store_keys_locked(ui_state.keys_locked);
 					if (rc != 0) {
-						LOG_WRN("Failed to persist key lock state: %d", rc);
+						LOG_WRN("Failed to update key lock state: %d", rc);
 					}
 					if (ui_state.keys_locked) {
 						rc = send_neutral_input_state(ui_state.operating_mode);

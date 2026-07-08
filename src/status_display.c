@@ -999,10 +999,6 @@ static int draw_battery_meter(uint16_t battery_mv, bool usb_power_present)
 	const uint16_t cap_y = BATTERY_BODY_Y + ((BATTERY_BODY_HEIGHT - BATTERY_CAP_HEIGHT) / 2U);
 	int rc;
 
-	if ((battery_mv == 0U) && !usb_power_present) {
-		return 0;
-	}
-
 	rc = draw_rounded_rect(BATTERY_BODY_X, BATTERY_BODY_Y,
 		BATTERY_BODY_WIDTH, BATTERY_BODY_HEIGHT);
 	if (rc != 0) {
@@ -1015,7 +1011,12 @@ static int draw_battery_meter(uint16_t battery_mv, bool usb_power_present)
 	}
 
 	if (usb_power_present) {
-		return draw_charging_bolt();
+		rc = draw_charging_bolt();
+		if (rc != 0) {
+			return rc;
+		}
+
+		return draw_small_text(BATTERY_PERCENT_X, BATTERY_PERCENT_Y, "CHG");
 	}
 
 	if (fill_width > 0U) {
