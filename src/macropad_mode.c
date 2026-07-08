@@ -90,7 +90,8 @@ bool macropad_mode_is_desktop(enum macropad_operating_mode mode)
 
 bool macropad_mode_has_pairing(enum macropad_operating_mode mode)
 {
-	return mode == MACROPAD_MODE_KINDLE_BLE;
+	return (mode == MACROPAD_MODE_KINDLE_BLE) ||
+		(mode == MACROPAD_MODE_DESKTOP_BLE);
 }
 
 size_t macropad_mode_count(void)

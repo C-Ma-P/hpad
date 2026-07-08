@@ -28,7 +28,8 @@
 
 #include "battery.h"
 #include "bringup.h"
-#include "desktop_ble_gatt.h"
+#include "consumer_action_engine.h"
+#include "desktop_ble_consumer_hid.h"
 #include "encoder.h"
 #include "key_leds.h"
 #include "kindle_ble_hid.h"
@@ -161,6 +162,7 @@ struct macropad_input_state {
 K_MSGQ_DEFINE(app_event_queue, sizeof(struct app_event), APP_EVENT_QUEUE_LEN, 4);
 
 static struct macropad_input_state macropad_input_state;
+static struct consumer_action_engine desktop_ble_action_engine;
 static struct battery_policy_state battery_policy_state = {
 	.filtered_mv = 0U,
 	.below_poweroff_since_ms = INT64_MIN,
@@ -190,6 +192,7 @@ static const struct options_menu_item options_menu_ble_items[] = {
 
 static const struct options_menu_item options_menu_desktop_ble_items[] = {
 	{ .action = OPTIONS_MENU_ACTION_SWITCH_MODE },
+	{ .action = OPTIONS_MENU_ACTION_FORGET_BLE_PAIRING },
 	{ .action = OPTIONS_MENU_ACTION_DEVICE_INFO },
 	{ .action = OPTIONS_MENU_ACTION_WIRELESS_FLASH },
 	{ .action = OPTIONS_MENU_ACTION_POWER_OFF },
@@ -216,6 +219,7 @@ static const char *const feedback_labels[FEEDBACK_ITEM_COUNT] = {
 
 static void handle_radio_delivery(enum radio_esb_tx_kind kind, bool acked);
 static void handle_radio_config(const macropad_config_t *config);
+static int desktop_ble_trigger_consumer_action(uint16_t action_id, void *user_data);
 
 static int app_queue_event(const struct app_event *event)
 {
@@ -358,18 +362,20 @@ static enum macropad_ble_link_state kindle_ble_link_state(void)
 
 static enum macropad_ble_link_state desktop_ble_link_state(void)
 {
-	switch (desktop_ble_gatt_get_state()) {
-	case DESKTOP_BLE_GATT_STATE_INACTIVE:
+	switch (desktop_ble_consumer_hid_get_state()) {
+	case DESKTOP_BLE_CONSUMER_HID_STATE_INACTIVE:
 		return MACROPAD_BLE_LINK_STATE_INACTIVE;
-	case DESKTOP_BLE_GATT_STATE_STARTING:
+	case DESKTOP_BLE_CONSUMER_HID_STATE_STARTING:
 		return MACROPAD_BLE_LINK_STATE_STARTING;
-	case DESKTOP_BLE_GATT_STATE_ADVERTISING:
+	case DESKTOP_BLE_CONSUMER_HID_STATE_ADVERTISING:
 		return MACROPAD_BLE_LINK_STATE_ADVERTISING;
-	case DESKTOP_BLE_GATT_STATE_CONNECTED:
+	case DESKTOP_BLE_CONSUMER_HID_STATE_CONNECTED:
 		return MACROPAD_BLE_LINK_STATE_CONNECTED;
-	case DESKTOP_BLE_GATT_STATE_STOPPING:
+	case DESKTOP_BLE_CONSUMER_HID_STATE_SECURITY_FAILED:
+		return MACROPAD_BLE_LINK_STATE_SECURITY_FAILED;
+	case DESKTOP_BLE_CONSUMER_HID_STATE_STOPPING:
 		return MACROPAD_BLE_LINK_STATE_STOPPING;
-	case DESKTOP_BLE_GATT_STATE_ERROR:
+	case DESKTOP_BLE_CONSUMER_HID_STATE_ERROR:
 	default:
 		return MACROPAD_BLE_LINK_STATE_ERROR;
 	}
@@ -393,7 +399,7 @@ static bool ble_connected_for_mode(enum macropad_operating_mode mode)
 		return kindle_ble_hid_is_connected();
 	}
 	if (mode == MACROPAD_MODE_DESKTOP_BLE) {
-		return desktop_ble_gatt_is_connected();
+		return desktop_ble_consumer_hid_is_connected();
 	}
 
 	return false;
@@ -461,7 +467,9 @@ static enum macropad_operating_mode mode_menu_target(size_t index)
 
 static const char *mode_menu_label(enum macropad_operating_mode current_mode)
 {
-	return macropad_mode_is_ble(current_mode) ? "Dongle Mode" : "BLE Mode";
+	ARG_UNUSED(current_mode);
+
+	return "Mode";
 }
 
 static size_t mode_menu_index(enum macropad_operating_mode current_mode)
@@ -875,7 +883,8 @@ static int start_transport(enum macropad_operating_mode mode)
 		return kindle_ble_hid_start();
 	}
 
-	return desktop_ble_gatt_start();
+	consumer_action_engine_reset(&desktop_ble_action_engine);
+	return desktop_ble_consumer_hid_start();
 }
 
 static int stop_transport(enum macropad_operating_mode mode)
@@ -888,7 +897,8 @@ static int stop_transport(enum macropad_operating_mode mode)
 		return kindle_ble_hid_stop();
 	}
 
-	return desktop_ble_gatt_stop();
+	consumer_action_engine_reset(&desktop_ble_action_engine);
+	return desktop_ble_consumer_hid_stop();
 }
 
 static int switch_operating_mode(struct app_ui_state *ui_state,
@@ -949,7 +959,11 @@ static int forget_ble_pairing(struct app_ui_state *ui_state,
 	show_transient_message(display_available, display_sleeping,
 		"Forgetting BLE...", NULL, 0);
 
-	rc = kindle_ble_hid_forget_pairing();
+	if (ui_state->operating_mode == MACROPAD_MODE_KINDLE_BLE) {
+		rc = kindle_ble_hid_forget_pairing();
+	} else {
+		rc = desktop_ble_consumer_hid_forget_pairing();
+	}
 	ui_state->ble_state = ble_link_state_for_mode(ui_state->operating_mode);
 	ui_state->connected = ble_connected_for_mode(ui_state->operating_mode);
 	ui_state->dongle_activity = false;
@@ -1193,7 +1207,8 @@ static int macropad_send_report(enum macropad_operating_mode mode)
 	};
 
 	if (mode == MACROPAD_MODE_DESKTOP_BLE) {
-		return desktop_ble_gatt_send_report(&report);
+		return consumer_action_engine_process_report(&desktop_ble_action_engine,
+			&report, NULL, desktop_ble_trigger_consumer_action, NULL);
 	}
 
 	return radio_esb_send_macropad_report(&report);
@@ -1212,7 +1227,7 @@ static int macropad_send_heartbeat(enum macropad_operating_mode mode)
 	report.usb_power_present = macropad_input_state.usb_power_present;
 
 	if (mode == MACROPAD_MODE_DESKTOP_BLE) {
-		return desktop_ble_gatt_send_report(&report);
+		return 0;
 	}
 
 	return radio_esb_send_heartbeat(&report);
@@ -1360,6 +1375,13 @@ static void handle_radio_config(const macropad_config_t *config)
 	};
 
 	(void)app_queue_event(&event);
+}
+
+static int desktop_ble_trigger_consumer_action(uint16_t action_id, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	return desktop_ble_consumer_hid_trigger_action(action_id);
 }
 
 static bool update_time_driven_ui(struct app_ui_state *state, int64_t now_ms)
@@ -1593,7 +1615,6 @@ int main(void)
 	ui_state.operating_mode = macropad_config_get_operating_mode();
 	ui_state.keys_locked = macropad_config_get_keys_locked();
 	ble_feedback = macropad_config_get_ble_feedback();
-	desktop_ble_gatt_set_config_handler(handle_radio_config);
 
 	rc = key_leds_init();
 	if (rc != 0) {

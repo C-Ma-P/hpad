@@ -167,12 +167,16 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	int rc;
 
-	rc = bt_hids_disconnected(&hids_obj, conn);
-	if (rc != 0) {
-		LOG_WRN("Failed to notify HIDS about disconnection: %d", rc);
+	if (!ble_active && (active_conn != conn)) {
+		return;
 	}
 
 	if (active_conn == conn) {
+		rc = bt_hids_disconnected(&hids_obj, conn);
+		if (rc != 0) {
+			LOG_WRN("Failed to notify HIDS about disconnection: %d", rc);
+		}
+
 		bt_conn_unref(active_conn);
 		active_conn = NULL;
 	}
