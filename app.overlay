@@ -104,6 +104,10 @@
 	};
 };
 
+&adc {
+	status = "okay";
+};
+
 &pinctrl {
 	oled_i2c_default: oled_i2c_default {
 		group1 {

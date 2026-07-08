@@ -48,6 +48,7 @@ LOG_MODULE_REGISTER(status_display, LOG_LEVEL_INF);
 #define MODE_LABEL_DONGLE_X 18U
 #define MODE_LABEL_BLE_X 2U
 #define MODE_LABEL_Y 1U
+#define LOCKED_LABEL_X 67U
 #define COMPACT_GLYPH_WIDTH 5U
 #define COMPACT_GLYPH_HEIGHT 7U
 #define COMPACT_GLYPH_GAP 1U
@@ -386,21 +387,21 @@ static int draw_usb_icon(void)
 	return draw_bitmap(x, TOP_ICON_Y, USB_ICON_WIDTH, USB_ICON_HEIGHT, rows);
 }
 
-static const char *ble_status_text(enum ble_hid_state state)
+static const char *ble_status_text(enum macropad_ble_link_state state)
 {
 	switch (state) {
-	case BLE_HID_STATE_INACTIVE:
+	case MACROPAD_BLE_LINK_STATE_INACTIVE:
 		return "BLE OFF";
-	case BLE_HID_STATE_STARTING:
+	case MACROPAD_BLE_LINK_STATE_STARTING:
 		return "BLE START";
-	case BLE_HID_STATE_ADVERTISING:
+	case MACROPAD_BLE_LINK_STATE_ADVERTISING:
 		return "BLE READY";
-	case BLE_HID_STATE_CONNECTED:
+	case MACROPAD_BLE_LINK_STATE_CONNECTED:
 		return "BLE LINKED";
-	case BLE_HID_STATE_SECURITY_FAILED:
-	case BLE_HID_STATE_ERROR:
+	case MACROPAD_BLE_LINK_STATE_SECURITY_FAILED:
+	case MACROPAD_BLE_LINK_STATE_ERROR:
 		return "BLE ERR";
-	case BLE_HID_STATE_STOPPING:
+	case MACROPAD_BLE_LINK_STATE_STOPPING:
 		return "BLE STOP";
 	default:
 		return "BLE ?";
@@ -409,11 +410,18 @@ static const char *ble_status_text(enum ble_hid_state state)
 
 static int draw_mode_label(enum macropad_operating_mode mode)
 {
-	if (mode == MACROPAD_OPERATING_MODE_BLE) {
-		return draw_small_text(MODE_LABEL_BLE_X, MODE_LABEL_Y, "BLE");
-	}
+	const uint16_t x = (macropad_mode_transport(mode) == MACROPAD_TRANSPORT_ESB) ?
+		MODE_LABEL_DONGLE_X : MODE_LABEL_BLE_X;
 
-	return draw_small_text(MODE_LABEL_DONGLE_X, MODE_LABEL_Y, "DONGLE");
+	return draw_small_text(x, MODE_LABEL_Y,
+		macropad_mode_short_name(mode));
+}
+
+static int draw_locked_label(void)
+{
+	return draw_compact_text_clipped(LOCKED_LABEL_X, MODE_LABEL_Y, "LOCKED",
+		(display_width_px > LOCKED_LABEL_X) ?
+			(uint16_t)(display_width_px - LOCKED_LABEL_X) : 0U);
 }
 
 static void tiny_digit_rows(uint8_t digit, uint8_t rows[TINY_GLYPH_HEIGHT])
@@ -1087,7 +1095,7 @@ int status_display_render(const struct status_display_state *state)
 		return rc;
 	}
 
-	if (state->operating_mode == MACROPAD_OPERATING_MODE_DONGLE) {
+	if (macropad_mode_transport(state->operating_mode) == MACROPAD_TRANSPORT_ESB) {
 		rc = draw_dongle_icon(state->connected, state->dongle_activity);
 		if (rc != 0) {
 			LOG_ERR("draw dongle icon failed: %d", rc);
@@ -1119,6 +1127,14 @@ int status_display_render(const struct status_display_state *state)
 		rc = draw_usb_icon();
 		if (rc != 0) {
 			LOG_ERR("draw USB icon failed: %d", rc);
+			return rc;
+		}
+	}
+
+	if (state->keys_locked) {
+		rc = draw_locked_label();
+		if (rc != 0) {
+			LOG_ERR("draw locked label failed: %d", rc);
 			return rc;
 		}
 	}
