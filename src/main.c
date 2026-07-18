@@ -714,6 +714,8 @@ static void brightness_menu_close(struct brightness_menu_state *menu)
 
 static void brightness_menu_move(struct brightness_menu_state *menu, int32_t delta)
 {
+	const int32_t min_brightness = (int32_t)DISPLAY_BRIGHTNESS_MIN;
+	const int32_t max_brightness = (int32_t)DISPLAY_BRIGHTNESS_MAX;
 	int32_t brightness;
 
 	if (!menu->open || (delta == 0)) {
@@ -721,10 +723,10 @@ static void brightness_menu_move(struct brightness_menu_state *menu, int32_t del
 	}
 
 	brightness = (int32_t)menu->edit_brightness + (delta * (int32_t)BRIGHTNESS_STEP);
-	if (brightness < DISPLAY_BRIGHTNESS_MIN) {
-		brightness = DISPLAY_BRIGHTNESS_MIN;
-	} else if (brightness > DISPLAY_BRIGHTNESS_MAX) {
-		brightness = DISPLAY_BRIGHTNESS_MAX;
+	if (brightness < min_brightness) {
+		brightness = min_brightness;
+	} else if (brightness > max_brightness) {
+		brightness = max_brightness;
 	}
 
 	menu->edit_brightness = (uint8_t)brightness;
