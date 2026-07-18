@@ -1,11 +1,13 @@
 #include "status_display.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <zephyr/device.h>
 #include <zephyr/display/cfb.h>
 #include <zephyr/drivers/display.h>
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
 
@@ -61,10 +63,20 @@ LOG_MODULE_REGISTER(status_display, LOG_LEVEL_INF);
 #define MENU_FIRST_ITEM_Y (MENU_TITLE_Y + COMPACT_GLYPH_HEIGHT + MENU_TITLE_BOTTOM_GAP)
 #define MENU_SCROLL_CUE_WIDTH (COMPACT_GLYPH_WIDTH + COMPACT_GLYPH_GAP)
 #define MESSAGE_LINE_GAP 3U
+#define DISPLAY_FADE_DURATION_MS 500U
+#define DISPLAY_FADE_STEPS 16U
+#define BRIGHTNESS_GAUGE_X 14U
+#define BRIGHTNESS_GAUGE_Y 15U
+#define BRIGHTNESS_GAUGE_WIDTH 72U
+#define BRIGHTNESS_GAUGE_HEIGHT 11U
+#define BRIGHTNESS_PERCENT_X 96U
+#define BRIGHTNESS_PERCENT_Y 18U
 
 static const struct device *const display = DEVICE_DT_GET(DISPLAY_NODE);
 static uint16_t display_width_px = DISPLAY_DEFAULT_WIDTH;
 static uint16_t display_height_px = DISPLAY_DEFAULT_HEIGHT;
+static uint8_t current_brightness = DISPLAY_BRIGHTNESS_DEFAULT;
+static bool display_is_blank;
 
 static const uint16_t usb_icon_rows[USB_ICON_HEIGHT] = {
 	0x024U,
@@ -117,6 +129,50 @@ static uint8_t clamp_u8(uint16_t value, uint8_t max_value)
 	}
 
 	return (uint8_t)value;
+}
+
+static uint8_t brightness_to_pct(uint8_t brightness)
+{
+	return (uint8_t)(((uint16_t)brightness * 100U + 127U) / 255U);
+}
+
+static int apply_display_brightness(uint8_t brightness)
+{
+	int rc = display_set_contrast(display, brightness);
+
+	if (rc == -ENOSYS) {
+		return 0;
+	}
+
+	return rc;
+}
+
+static int fade_display_brightness(uint8_t from, uint8_t to)
+{
+	const uint32_t sleep_ms = DISPLAY_FADE_DURATION_MS / DISPLAY_FADE_STEPS;
+
+	for (uint8_t step = 0U; step <= DISPLAY_FADE_STEPS; ++step) {
+		uint8_t brightness;
+		int rc;
+
+		if (to >= from) {
+			brightness = (uint8_t)(from +
+				(((uint16_t)(to - from) * step) / DISPLAY_FADE_STEPS));
+		} else {
+			brightness = (uint8_t)(from -
+				(((uint16_t)(from - to) * step) / DISPLAY_FADE_STEPS));
+		}
+
+		rc = apply_display_brightness(brightness);
+		if (rc != 0) {
+			return rc;
+		}
+		if (step < DISPLAY_FADE_STEPS) {
+			k_msleep(sleep_ms);
+		}
+	}
+
+	return 0;
 }
 
 static int draw_bitmap(uint16_t x, uint16_t y, uint8_t width, uint8_t height,
@@ -406,6 +462,20 @@ static const char *ble_status_text(enum macropad_ble_link_state state)
 	default:
 		return "BLE ?";
 	}
+}
+
+static const char *format_ble_status_text(const struct status_display_state *state,
+					  char *buf, size_t buf_size)
+{
+	if ((state->ble_retry_attempt > 0U) &&
+	    (state->ble_retry_seconds_remaining > 0U)) {
+		(void)snprintf(buf, buf_size, "RETRY #%u %u",
+			(unsigned int)state->ble_retry_attempt,
+			(unsigned int)state->ble_retry_seconds_remaining);
+		return buf;
+	}
+
+	return ble_status_text(state->ble_state);
 }
 
 static int draw_mode_label(enum macropad_operating_mode mode)
@@ -1032,6 +1102,34 @@ static int draw_battery_meter(uint16_t battery_mv, bool usb_power_present)
 	return draw_small_percent(BATTERY_PERCENT_X, BATTERY_PERCENT_Y, pct);
 }
 
+static int draw_brightness_gauge(uint8_t brightness)
+{
+	const uint8_t pct = brightness_to_pct(brightness);
+	const uint8_t inner_width = BRIGHTNESS_GAUGE_WIDTH - (BATTERY_FILL_INSET * 2U);
+	const uint8_t inner_height = BRIGHTNESS_GAUGE_HEIGHT - (BATTERY_FILL_INSET * 2U);
+	const uint8_t fill_width = clamp_u8(
+		((uint16_t)inner_width * pct + 99U) / 100U,
+		inner_width);
+	int rc;
+
+	rc = draw_rounded_rect(BRIGHTNESS_GAUGE_X, BRIGHTNESS_GAUGE_Y,
+		BRIGHTNESS_GAUGE_WIDTH, BRIGHTNESS_GAUGE_HEIGHT);
+	if (rc != 0) {
+		return rc;
+	}
+
+	if (fill_width > 0U) {
+		rc = fill_rect(BRIGHTNESS_GAUGE_X + BATTERY_FILL_INSET,
+			BRIGHTNESS_GAUGE_Y + BATTERY_FILL_INSET,
+			fill_width, inner_height);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	return draw_small_percent(BRIGHTNESS_PERCENT_X, BRIGHTNESS_PERCENT_Y, pct);
+}
+
 int status_display_init(void)
 {
 	int rc;
@@ -1056,6 +1154,7 @@ int status_display_init(void)
 	if ((rc != 0) && (rc != -ENOSYS)) {
 		return rc;
 	}
+	display_is_blank = false;
 
 	rc = cfb_framebuffer_init(display);
 	LOG_DBG("cfb_framebuffer_init() -> %d", rc);
@@ -1107,8 +1206,10 @@ int status_display_render(const struct status_display_state *state)
 			return rc;
 		}
 	} else {
+		char ble_text[16];
+
 		rc = draw_compact_text_clipped(MODE_LABEL_BLE_X, MODE_LABEL_Y,
-			ble_status_text(state->ble_state),
+			format_ble_status_text(state, ble_text, sizeof(ble_text)),
 			(display_width_px > MODE_LABEL_BLE_X) ?
 				(uint16_t)(display_width_px - MODE_LABEL_BLE_X) : 0U);
 		if (rc != 0) {
@@ -1403,12 +1504,88 @@ int status_display_render_message(const char *line1, const char *line2)
 	return rc;
 }
 
+int status_display_render_brightness(uint8_t brightness)
+{
+	int rc;
+
+	rc = cfb_framebuffer_clear(display, false);
+	if (rc != 0) {
+		LOG_ERR("cfb_framebuffer_clear failed: %d", rc);
+		return rc;
+	}
+
+	rc = draw_compact_text_clipped(MENU_TITLE_X, MENU_TITLE_Y, "Brightness",
+		(display_width_px > MENU_TITLE_X) ?
+			(uint16_t)(display_width_px - MENU_TITLE_X) : 0U);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = draw_brightness_gauge(brightness);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = cfb_framebuffer_finalize(display);
+	if (rc != 0) {
+		LOG_ERR("cfb_framebuffer_finalize failed: %d", rc);
+	}
+
+	return rc;
+}
+
+int status_display_set_brightness(uint8_t brightness)
+{
+	int rc;
+
+	current_brightness = brightness;
+	if (display_is_blank) {
+		return 0;
+	}
+
+	rc = apply_display_brightness(brightness);
+	if (rc != 0) {
+		LOG_WRN("display_set_contrast failed: %d", rc);
+	}
+
+	return rc;
+}
+
+uint8_t status_display_get_brightness(void)
+{
+	return current_brightness;
+}
+
 int status_display_blank(void)
 {
-	return display_blanking_on(display);
+	int rc;
+
+	rc = fade_display_brightness(current_brightness, 0U);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = display_blanking_on(display);
+	if (rc == -ENOSYS) {
+		display_is_blank = true;
+		return 0;
+	}
+	if (rc == 0) {
+		display_is_blank = true;
+	}
+
+	return rc;
 }
 
 int status_display_unblank(void)
 {
-	return display_blanking_off(display);
+	int rc;
+
+	rc = display_blanking_off(display);
+	if ((rc != 0) && (rc != -ENOSYS)) {
+		return rc;
+	}
+	display_is_blank = false;
+
+	return fade_display_brightness(0U, current_brightness);
 }

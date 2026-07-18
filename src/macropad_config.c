@@ -15,6 +15,7 @@ LOG_MODULE_REGISTER(macropad_config, LOG_LEVEL_INF);
 #define MACROPAD_CONFIG_SETTINGS_KEY MACROPAD_CONFIG_SETTINGS_ROOT "/leds"
 #define MACROPAD_MODE_SETTINGS_KEY MACROPAD_CONFIG_SETTINGS_ROOT "/mode"
 #define MACROPAD_BLE_FEEDBACK_SETTINGS_KEY MACROPAD_CONFIG_SETTINGS_ROOT "/ble_feedback"
+#define MACROPAD_DISPLAY_BRIGHTNESS_SETTINGS_KEY MACROPAD_CONFIG_SETTINGS_ROOT "/display_brightness"
 
 static macropad_config_t stored_config;
 static bool stored_config_loaded;
@@ -23,6 +24,8 @@ static bool stored_operating_mode_loaded;
 static enum macropad_ble_feedback stored_ble_feedback;
 static bool stored_ble_feedback_loaded;
 static bool stored_keys_locked;
+static uint8_t stored_display_brightness;
+static bool stored_display_brightness_loaded;
 
 static void macropad_config_default(macropad_config_t *config)
 {
@@ -122,6 +125,31 @@ static int macropad_config_settings_set(const char *name, size_t len_rd,
 		return 0;
 	}
 
+	if (settings_name_steq(name, "display_brightness", NULL)) {
+		uint8_t loaded_brightness;
+
+		if (len_rd != sizeof(loaded_brightness)) {
+			LOG_WRN("Stored display brightness length %zu does not match expected %zu",
+				len_rd, sizeof(loaded_brightness));
+			stored_display_brightness_loaded = false;
+			return 0;
+		}
+
+		rc = read_cb(cb_arg, &loaded_brightness, sizeof(loaded_brightness));
+		if (rc < 0) {
+			return rc;
+		}
+		if (rc != sizeof(loaded_brightness)) {
+			LOG_WRN("Settings read returned %d bytes for display brightness", rc);
+			stored_display_brightness_loaded = false;
+			return 0;
+		}
+
+		stored_display_brightness = loaded_brightness;
+		stored_display_brightness_loaded = true;
+		return 0;
+	}
+
 	if (!settings_name_steq(name, "leds", NULL)) {
 		return -ENOENT;
 	}
@@ -167,6 +195,8 @@ int macropad_config_init(void)
 	stored_ble_feedback = MACROPAD_BLE_FEEDBACK_LED_MED;
 	stored_ble_feedback_loaded = false;
 	stored_keys_locked = false;
+	stored_display_brightness = DISPLAY_BRIGHTNESS_DEFAULT;
+	stored_display_brightness_loaded = false;
 
 	rc = settings_subsys_init();
 	if ((rc != 0) && (rc != -EALREADY)) {
@@ -194,6 +224,12 @@ int macropad_config_init(void)
 		LOG_INF("Loaded persisted BLE feedback %u", stored_ble_feedback);
 	} else {
 		LOG_INF("No persisted BLE feedback found, defaulting to medium LED");
+	}
+	if (stored_display_brightness_loaded) {
+		LOG_INF("Loaded persisted display brightness 0x%02x", stored_display_brightness);
+	} else {
+		LOG_INF("No persisted display brightness found, defaulting to 0x%02x",
+			stored_display_brightness);
 	}
 	LOG_INF("Key lock defaulted to unlocked");
 
@@ -306,5 +342,32 @@ int macropad_config_store_keys_locked(bool locked)
 
 	stored_keys_locked = locked;
 	LOG_INF("Updated volatile key lock state %u", locked ? 1U : 0U);
+	return 0;
+}
+
+uint8_t macropad_config_get_display_brightness(void)
+{
+	return stored_display_brightness;
+}
+
+int macropad_config_store_display_brightness(uint8_t brightness)
+{
+	int rc;
+
+	if (stored_display_brightness_loaded &&
+	    (stored_display_brightness == brightness)) {
+		return 0;
+	}
+
+	stored_display_brightness = brightness;
+	stored_display_brightness_loaded = true;
+	rc = settings_save_one(MACROPAD_DISPLAY_BRIGHTNESS_SETTINGS_KEY,
+			       &brightness, sizeof(brightness));
+	if (rc != 0) {
+		LOG_WRN("settings_save_one failed: %d, keeping display brightness in memory", rc);
+		return rc;
+	}
+
+	LOG_INF("Stored display brightness 0x%02x", brightness);
 	return 0;
 }

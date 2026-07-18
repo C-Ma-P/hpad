@@ -37,6 +37,8 @@ LOG_MODULE_REGISTER(kindle_ble_hid, LOG_LEVEL_INF);
 #define HID_USAGE_KEYBOARD_HOME 0x4A
 #define HID_USAGE_KEYBOARD_PAGE_UP 0x4B
 #define HID_USAGE_KEYBOARD_PAGE_DOWN 0x4E
+#define KINDLE_BLE_ADV_RETRY_BASE_MS 1000U
+#define KINDLE_BLE_ADV_RETRY_MAX_ATTEMPTS 5U
 
 BT_HIDS_DEF(hids_obj, INPUT_REP_KEYS_LEN);
 
@@ -59,13 +61,72 @@ static bool hids_initialized;
 static bool advertising;
 static bool ble_active;
 static bool protocol_boot;
+static bool advertising_retry_work_initialized;
 static uint8_t current_matrix_keys;
+static atomic_t advertising_retry_attempt = ATOMIC_INIT(0);
+static atomic_t advertising_retry_deadline_ms = ATOMIC_INIT(0);
+static atomic_t advertising_retry_pending = ATOMIC_INIT(0);
 static uint8_t last_report[INPUT_REP_KEYS_LEN];
 static atomic_t ble_state = ATOMIC_INIT(KINDLE_BLE_HID_STATE_INACTIVE);
+static struct k_work_delayable advertising_retry_work;
+
+static int advertising_start(void);
+static void advertising_retry_work_handler(struct k_work *work);
 
 static void state_set(enum kindle_ble_hid_state state)
 {
 	atomic_set(&ble_state, (atomic_val_t)state);
+}
+
+static void advertising_retry_work_init_once(void)
+{
+	if (advertising_retry_work_initialized) {
+		return;
+	}
+
+	k_work_init_delayable(&advertising_retry_work, advertising_retry_work_handler);
+	advertising_retry_work_initialized = true;
+}
+
+static void reset_advertising_retry(void)
+{
+	atomic_set(&advertising_retry_attempt, 0);
+	atomic_set(&advertising_retry_deadline_ms, 0);
+	atomic_set(&advertising_retry_pending, 0);
+	if (advertising_retry_work_initialized) {
+		(void)k_work_cancel_delayable(&advertising_retry_work);
+	}
+}
+
+static void schedule_advertising_retry(const char *reason)
+{
+	uint8_t attempt = (uint8_t)atomic_get(&advertising_retry_attempt);
+	uint32_t delay_ms;
+
+	if (!ble_active) {
+		return;
+	}
+
+	advertising_retry_work_init_once();
+	state_set(KINDLE_BLE_HID_STATE_ERROR);
+	if (attempt >= KINDLE_BLE_ADV_RETRY_MAX_ATTEMPTS) {
+		atomic_set(&advertising_retry_pending, 0);
+		LOG_ERR("BLE HID advertising retry exhausted after %u attempts (%s)",
+			(unsigned int)attempt, reason);
+		return;
+	}
+
+	delay_ms = KINDLE_BLE_ADV_RETRY_BASE_MS << attempt;
+	attempt++;
+	atomic_set(&advertising_retry_attempt, attempt);
+	atomic_set(&advertising_retry_deadline_ms,
+		(atomic_val_t)(k_uptime_get_32() + delay_ms));
+	atomic_set(&advertising_retry_pending, 1);
+	LOG_WRN("BLE HID retry %u/%u in %u ms (%s)",
+		(unsigned int)attempt,
+		(unsigned int)KINDLE_BLE_ADV_RETRY_MAX_ATTEMPTS,
+		(unsigned int)delay_ms, reason);
+	(void)k_work_reschedule(&advertising_retry_work, K_MSEC(delay_ms));
 }
 
 static const struct bt_data ad[] = {
@@ -79,6 +140,34 @@ static const struct bt_data ad[] = {
 static const struct bt_data sd[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, KINDLE_BLE_HID_DEVICE_NAME, KINDLE_BLE_HID_DEVICE_NAME_LEN),
 };
+
+static void advertising_retry_work_handler(struct k_work *work)
+{
+	int rc;
+
+	ARG_UNUSED(work);
+
+	atomic_set(&advertising_retry_pending, 0);
+	if (!ble_active || (active_conn != NULL)) {
+		return;
+	}
+
+	state_set(KINDLE_BLE_HID_STATE_STARTING);
+	rc = advertising_start();
+	if (rc != 0) {
+		schedule_advertising_retry("advertising start failed");
+	}
+}
+
+static void restart_advertising_or_retry(const char *reason)
+{
+	int rc;
+
+	rc = advertising_start();
+	if (rc != 0) {
+		schedule_advertising_retry(reason);
+	}
+}
 
 static int advertising_start(void)
 {
@@ -138,8 +227,8 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	if (err != 0U) {
 		LOG_WRN("BLE connection failed: 0x%02x", err);
-		state_set(KINDLE_BLE_HID_STATE_ERROR);
-		(void)advertising_start();
+		advertising = false;
+		schedule_advertising_retry("connection failed");
 		return;
 	}
 
@@ -159,6 +248,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	active_conn = bt_conn_ref(conn);
 	protocol_boot = false;
 	advertising = false;
+	reset_advertising_retry();
 	state_set(KINDLE_BLE_HID_STATE_CONNECTED);
 	LOG_INF("BLE HID connected");
 }
@@ -186,7 +276,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	LOG_INF("BLE HID disconnected reason=0x%02x", reason);
 
 	if (ble_active) {
-		(void)advertising_start();
+		restart_advertising_or_retry("disconnect");
 	} else {
 		state_set(KINDLE_BLE_HID_STATE_INACTIVE);
 	}
@@ -370,6 +460,8 @@ int kindle_ble_hid_start(void)
 {
 	int rc;
 
+	advertising_retry_work_init_once();
+	reset_advertising_retry();
 	state_set(KINDLE_BLE_HID_STATE_STARTING);
 
 	rc = hids_init_once();
@@ -415,6 +507,7 @@ int kindle_ble_hid_stop(void)
 
 	state_set(KINDLE_BLE_HID_STATE_STOPPING);
 	ble_active = false;
+	reset_advertising_retry();
 	advertising_stop();
 
 	if (active_conn != NULL) {
@@ -466,6 +559,7 @@ int kindle_ble_hid_forget_pairing(void)
 	}
 
 	advertising_stop();
+	reset_advertising_retry();
 
 	if (active_conn != NULL) {
 		int disconnect_rc;
@@ -499,6 +593,7 @@ int kindle_ble_hid_forget_pairing(void)
 
 	rc = advertising_start();
 	if (rc != 0) {
+		schedule_advertising_retry("pairing reset");
 		return rc;
 	}
 
@@ -552,6 +647,31 @@ int kindle_ble_hid_send_key_tap(uint8_t usage)
 bool kindle_ble_hid_is_connected(void)
 {
 	return active_conn != NULL;
+}
+
+bool kindle_ble_hid_get_retry_status(uint8_t *attempt, uint8_t *seconds_remaining)
+{
+	int32_t remaining_ms;
+
+	if ((attempt == NULL) || (seconds_remaining == NULL) ||
+	    !ble_active || (atomic_get(&advertising_retry_pending) == 0)) {
+		return false;
+	}
+
+	*attempt = (uint8_t)atomic_get(&advertising_retry_attempt);
+	if (*attempt == 0U) {
+		return false;
+	}
+
+	remaining_ms = (int32_t)((uint32_t)atomic_get(&advertising_retry_deadline_ms) -
+		k_uptime_get_32());
+	if (remaining_ms <= 0) {
+		*seconds_remaining = 1U;
+	} else {
+		*seconds_remaining = (uint8_t)((remaining_ms + 999) / 1000);
+	}
+
+	return true;
 }
 
 enum kindle_ble_hid_state kindle_ble_hid_get_state(void)

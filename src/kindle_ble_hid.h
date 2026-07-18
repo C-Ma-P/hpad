@@ -20,6 +20,7 @@ int kindle_ble_hid_forget_pairing(void);
 int kindle_ble_hid_send_key_state(uint8_t keys);
 int kindle_ble_hid_send_key_tap(uint8_t usage);
 bool kindle_ble_hid_is_connected(void);
+bool kindle_ble_hid_get_retry_status(uint8_t *attempt, uint8_t *seconds_remaining);
 enum kindle_ble_hid_state kindle_ble_hid_get_state(void);
 
 #define KINDLE_BLE_HID_USAGE_KEYBOARD_ENTER 0x28

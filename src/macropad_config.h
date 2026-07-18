@@ -6,6 +6,10 @@
 
 #include "wire_protocol.h"
 
+#define DISPLAY_BRIGHTNESS_DEFAULT 0x8FU
+#define DISPLAY_BRIGHTNESS_MIN 0x08U
+#define DISPLAY_BRIGHTNESS_MAX UINT8_MAX
+
 enum macropad_operating_mode {
 	MACROPAD_MODE_DESKTOP_DONGLE = 0,
 	MACROPAD_MODE_KINDLE_BLE = 1,
@@ -31,5 +35,7 @@ enum macropad_ble_feedback macropad_config_get_ble_feedback(void);
 int macropad_config_store_ble_feedback(enum macropad_ble_feedback feedback);
 bool macropad_config_get_keys_locked(void);
 int macropad_config_store_keys_locked(bool locked);
+uint8_t macropad_config_get_display_brightness(void);
+int macropad_config_store_display_brightness(uint8_t brightness);
 
 #endif
